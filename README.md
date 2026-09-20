@@ -37,7 +37,27 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Device auto   # 构建 + 安
 
 签名：`build.ps1` 默认读 `cmks.jks`；自行生成同名 keystore（密码写在脚本里，可改）。
 
+## 免责声明 / Disclaimer
+
+**中文**
+
+- 本模块仅供**自有设备 / 已明确授权的测试环境**使用（安全研究、兼容性验证）。请勿用于任何未授权设备或未授权用途。
+- 本模块与网易云音乐及其关联公司**无任何隶属、合作、赞助或背书关系**；文中出现的产品名、商标、图标归各自权利人所有。
+- 模块只在**本机进程内**读取/改写目标 App 自身的网络请求与本地缓存：**不提供服务端能力、不绕过付费或版权内容、不修改服务端数据、不上传或收集任何账号与内容**。日志与台账仅落在本机 App 私有目录（`/sdcard/Android/data/com.netease.cloudmusic/files/`）。
+- 软件按"**现状**"提供，**不附带任何明示或暗示的担保**（含可商销性、特定用途适用性）。App 版本升级后个别混淆锚点可能漂移，功能可能部分失效——由此产生的一切后果由使用者自行承担。
+- 使用前请自行确认所在地法律法规及目标 App 的用户协议。**如权利人提出要求，会立即下架本仓库与发布物。**
+- 请只从本仓库的 **Release** 获取安装包（并核对 sha256）；第三方渠道分发的 APK 与本项目无关。
+
+**English**
+
+- For **own devices / explicitly authorized test environments only** (security research, compatibility verification). Do not use on devices or for purposes you are not authorized for.
+- This project is **not affiliated with, endorsed by, or sponsored by** NetEase CloudMusic or its affiliates. All product names and trademarks belong to their respective owners.
+- The module only reads/rewrites the target app's own requests and local cache **inside the local process**: no server-side capability, no bypass of paid or copyrighted content, no modification of server data, and no collection or upload of accounts or content. Logs and records stay in the app's private directory on-device.
+- Provided **"AS IS"**, **without warranty of any kind**, express or implied. After an app update, some obfuscated anchors may drift and features may partially break; you bear any consequences of use.
+- Verify local laws and the app's terms of service before use. **Content will be taken down immediately upon a rights holder's request.**
+- Download only from this repository's **Releases** (verify the sha256); APKs from other channels are unrelated to this project.
+
 ## 说明
 
-- 仅供**自有设备 / 已授权范围**使用；模块只在本机进程内读写该 App 自身的网络请求与本地缓存。
-- 目标版本 9.5.96(9005096)。App 升级后个别混淆锚点可能漂移，模块内置 DexKit 兜底与自检日志（`/sdcard/Android/data/com.netease.cloudmusic/files/cm_hook.log`）。
+- 目标版本 9.5.96(9005096)。模块内置 DexKit 兜底与自检日志（`/sdcard/Android/data/com.netease.cloudmusic/files/cm_hook.log`）。
+- 构建：见上文「构建」段（依赖二进制不随仓库提供）。
