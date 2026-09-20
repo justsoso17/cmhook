@@ -1,7 +1,7 @@
 # CM Hook 构建脚本 (PowerShell 版) — 可复现全链
 # 用法: powershell -ExecutionPolicy Bypass -File build.ps1 [-NoInstall]
 # 关键约束:
-#   1) classes.jar 只打 com/ 包 —— src/de/ 是 LSPosed API stub(compile-only), 进 dex 会被拒载
+#   1) classes.jar 只打 com/ 包 —— de/ 与 QOlJwxewM/ 是 LSPosed API stub, 进 dex 会被拒载
 #   2) javac 失败必须中止(门禁), 不带病打包
 #   3) resources.arsc / .so 用 ZIP_STORED, 最后 zipalign -p 4 页对齐(libdexkit.so mmap)
 #   4) AndroidManifest 改动必须重编 base.apk 模板, 否则 versionCode 不生效
@@ -33,9 +33,18 @@ Step "3/7 d8"
 if ($LASTEXITCODE -ne 0) { throw "d8 失败" }
 Write-Host ("classes.dex: {0:N2} MB" -f ((Get-Item dexout\classes.dex).Length / 1MB))
 
-Step "4/7 aapt2 重编模板 (versionCode/Name 生效)"
-& "$sdk\android-14\aapt2.exe" link --manifest AndroidManifest.xml -I "$sdk\android.jar" `
-    --min-sdk-version 24 --target-sdk-version 33 -o base.apk
+Step "4/7 aapt2 重编模板 (versionCode/Name/图标 生效)"
+$resZip = "res-compiled.zip"
+if (Test-Path res) {
+    Remove-Item -Force $resZip -ErrorAction SilentlyContinue
+    & "$sdk\android-14\aapt2.exe" compile --dir res -o $resZip
+    if ($LASTEXITCODE -ne 0) { throw "aapt2 compile(res) 失败" }
+    & "$sdk\android-14\aapt2.exe" link --manifest AndroidManifest.xml -I "$sdk\android.jar" `
+        --min-sdk-version 24 --target-sdk-version 33 -o base.apk $resZip
+} else {
+    & "$sdk\android-14\aapt2.exe" link --manifest AndroidManifest.xml -I "$sdk\android.jar" `
+        --min-sdk-version 24 --target-sdk-version 33 -o base.apk
+}
 if ($LASTEXITCODE -ne 0) { throw "aapt2 失败" }
 
 Step "5/7 合并 APK (build_apk.py)"
@@ -61,10 +70,6 @@ if ($NoInstall) { Write-Host "`n[跳过安装]" -ForegroundColor Yellow; exit 0 
 Step "7/7 安装 + 重启目标 APP"
 if ([string]::IsNullOrWhiteSpace($Device) -or $Device -eq "auto") {
     $Device = (& adb devices) | Select-String -Pattern '^\S+\s+device$' | ForEach-Object { ($_.ToString() -split '\s+')[0] } | Select-Object -First 1
-}
-if ([string]::IsNullOrWhiteSpace($Device)) {
-    Write-Host "`n[无在线设备 → 仅构建, 跳过安装]" -ForegroundColor Yellow
-    exit 0
 }
 Write-Host "目标设备: [$Device]"
 # 走 cmd /c 预拼命令行: PS5.1 下直接对 native 传 -r 会被吃掉
