@@ -1,0 +1,16 @@
+# 构建产物 / 本地产物
+obj/
+dexout/
+classes.jar
+jar_stubs.jar
+*.apk
+*.idsig
+base*.apk
+*.jks
+*.png
+*.log
+*.bak_*
+# 第三方二进制依赖(按 README 自行获取)
+libs/*.jar
+libs/dexkit_aar/
+libs/*.aar

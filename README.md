@@ -1,0 +1,43 @@
+# CM Hook
+
+网易云音乐（`com.netease.cloudmusic`，实测 9.5.96 / 9005096）的本机 LSPosed 模块：协议观测 + 界面整理 + 消息防撤回台账。
+
+## 功能
+
+- **消息防撤回台账**：私信聊天页右下角「撤回 N」胶囊（可拖动、位置持久），点开只列**本会话**被撤原文；
+  记账走三源：① 列表消失 ② 本地库窗口缺失（`private_chat_message_db`）③ 库条目消失
+- **首页内容清理**：`推荐` 只保留白名单块（`home_clean_keep`，默认 每日推荐/猜你喜欢/根据你喜爱推荐），
+  锚点块命中时按锚点切；配套清 MMKV 块缓存（`SP_MIX_CONTAINER` / `HOME_RECOMMEND_PAGE_*`），并可在 MMKV 读取时过滤
+- **播客「为你推荐」清理**、**关注页「乐迷团」隐藏**、**去开屏广告**、**长按顶栏搜索区进听歌识曲**
+- **独白 HUD**：把接口调用翻译成人话的悬浮窗（可拖动/折叠/✕关闭，仅目标 App 前台可见）
+- **频道精细控制**（保留白名单）、**App 探测清单**、**DexKit 锚点自检**（L0 健康检查 / L1 按需预热 / L2 手动重建）
+- 设置入口：目标 App 的**设置页右下角**「⚙ CM Hook」胶囊
+
+## 构建
+
+依赖不随仓库提供（自行获取）：
+
+| 文件 | 来源 |
+|---|---|
+| `libs/dexkit.jar` | DexKit 2.2.0 AAR 里的 `classes.jar` |
+| `libs/kotlin-stdlib.jar` | `org.jetbrains.kotlin:kotlin-stdlib:1.5.0` |
+| `libs/flatbuffers.jar` | `com.google.flatbuffers:flatbuffers-java:23.5.26` |
+| `libs/dexkit_aar/jni/<abi>/libdexkit.so` | DexKit AAR 的 `jni/{arm64-v8a,armeabi-v7a,x86,x86_64}` |
+
+DexKit 2.2.0 AAR：
+`https://maven-central.storage-download.googleapis.com/maven2/org/luckypray/dexkit/2.2.0/dexkit-2.2.0.aar`
+
+需要：JDK 8+、Android `build-tools`（aapt2 / zipalign / apksigner）、`r8.jar`、`adb`。
+目录约定：仓库同级放一个 `sdk/`（`android.jar`、`r8.jar`、`android-14/{aapt2,zipalign,apksigner}`）。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1 -NoInstall    # 只构建
+powershell -ExecutionPolicy Bypass -File build.ps1 -Device auto   # 构建 + 安装到设备
+```
+
+签名：`build.ps1` 默认读 `cmks.jks`；自行生成同名 keystore（密码写在脚本里，可改）。
+
+## 说明
+
+- 仅供**自有设备 / 已授权范围**使用；模块只在本机进程内读写该 App 自身的网络请求与本地缓存。
+- 目标版本 9.5.96(9005096)。App 升级后个别混淆锚点可能漂移，模块内置 DexKit 兜底与自检日志（`/sdcard/Android/data/com.netease.cloudmusic/files/cm_hook.log`）。
