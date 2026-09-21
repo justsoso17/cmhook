@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="io.github.justsoso17.cmhook" android:versionCode="100" android:versionName="1.0.0">
+    package="io.github.justsoso17.cmhook" android:versionCode="101" android:versionName="1.0.1">
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="33"/>
     <application android:label="CM Hook" android:icon="@mipmap/ic_launcher" android:hasCode="true">
         <meta-data android:name="xposedmodule" android:value="true"/>
