@@ -1,7 +1,5 @@
 # CM Hook
 
-<img src="res/mipmap-xxxhdpi/ic_launcher.png" width="96" alt="icon">
-
 网易云音乐（`com.netease.cloudmusic`，实测 9.5.96 / 9005096）的本机 LSPosed 模块：协议观测 + 界面整理 + 消息防撤回台账。
 
 ## 功能
