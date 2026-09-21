@@ -18,6 +18,33 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
 public class MainHook implements IXposedHookLoadPackage {
+/**
+ * CM Hook — 网易云音乐净化模块 (LSPosed, 单文件全量逻辑)
+ * 目标: com.netease.cloudmusic 9.5.96 (versionCode 9005096), 兼容锚点漂移见各节注释
+ *
+ * 分区目录 (按方法名前缀可检索):
+ *   [配置]   loadPrefs/savePref/setHudEnabled          — cmhook_prefs 读写, Application.attach 早载
+ *   [日志]   flog/LSP_TAGS/trunc/rotateLogIfHuge       — 双通道: cm_hook.log(全量) + LSPosed(白名单镜像)
+ *   [HUD]    hud/pushHud/renderHud/createHud/attachEntryChip/translatePath — 独白悬浮窗+设置入口芯片
+ *   [面板]   showSettingsDialog/showProbeDialog/showTabsKeepDialog/mi* — Miuix 风格纯 View 弹窗
+ *   [频道]   applyTopTabs/applyTabsCentering/filterHiddenTabs/reapplyLiveFilter/
+ *            installFineDataFilter/resolveTabBaseViaDexkit/installTabGuard — 顶栏频道精细控制
+ *   [乐迷团] installFansHideEventHook/hideFansGroupEntry/startFansHideWatcher/hideItemOf — 关注页透明化
+ *   [卡片]   cardSweepTick/cardScan/replaceVipCard/isVipCardText — 抽屉VIP挽回卡替换为自定义图(方案A)
+ *   [DexKit] dexBridge/dexkitFindMethodsByString/dexCacheGet/dexCachePut/dexHealthCheck/dexRebuildCache — 防漂移基建
+ *   [去广告] 渠道闸门V()伪装 + LoadingAdManager.E + LoadingAdActivity + 网络层 ad/loading/* 清空 — 三层
+ *   [清理]   isHomeFeedUrl/filterHomeFeed/emptyJsonArrayForKey/purgeHomeFeedCache/dumpFeed* — 首页/播客
+ *   [防撤回] rv系列/notifyRevoke/hookRevokeHandlerMethod/dexkitFindRevokeHandlers — 三源台账+胶囊浮层
+ *   [识曲]   startIdentify — 长按搜索区进识曲(PackageManager 枚举兜底)
+ *   [入口]   handleLoadPackage/installBusinessHooks — hook 安装总装线(逐条 try/catch 独立)
+ *   [反射]   fieldGet/invoke0/invoke1/callStr/callInt — 宿主类纯反射访问工具
+ *
+ * 纪律 (历史踩坑沉淀, 违反必翻车):
+ *   1. 业务类在 DelegateLastClassLoader(Tinker系), hook 必须从 Activity 实例反拿真身加载器
+ *   2. DexKit/搜索遍历严禁主线程 (曾 ANR); 高频路径 (getItem/getItemCount) 严禁写日志
+ *   3. 新增 hook 一律 try/catch 独立安装, 失败不连坐
+ *   4. 插入新代码用"安全锚点", v5/v6 区间曾有误删史
+ */
 
     private static final String TARGET_PKG = "com.netease.cloudmusic";
     private static final Object LOG_LOCK = new Object();
@@ -49,6 +76,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean prefPodcastClean = true; // v20: 我的-播客-为你推荐 清理
     private static volatile boolean prefProtoCollect = true;  // v22: 协议采集(关=跳过采集hook与DexKit锚点搜索)
     private static volatile boolean prefFansHide = true;      // v31: 关注页隐藏「乐迷团」项
+    private static volatile boolean prefCardCustom = true;    // v8.6: 抽屉VIP挽回卡替换为自定义内容
     private static volatile boolean prefIdentifyLongPress = true;  // v48: 长按搜索区=听歌识曲
     private static volatile String prefUiCollapsed = "g3";          // v52: 面板折叠的组 id(逗号分隔)
     private static volatile ClassLoader businessCl = null;    // v22: 业务运行时加载器(供 UI 手动重建缓存用)
@@ -135,6 +163,7 @@ public class MainHook implements IXposedHookLoadPackage {
             prefPodcastClean = sp.getBoolean("podcast_clean", true);
             prefProtoCollect = sp.getBoolean("proto_collect", true);
             prefFansHide = sp.getBoolean("fans_hide", true);
+            prefCardCustom = sp.getBoolean("card_custom", true);
             prefIdentifyLongPress = sp.getBoolean("identify_longpress", true);
             prefUiCollapsed = sp.getString("ui_collapsed", "g3");
             prefHomeCleanAnchor = sp.getString("home_clean_anchor", HOME_CLEAN_ANCHOR_DEFAULT);
@@ -759,6 +788,19 @@ public class MainHook implements IXposedHookLoadPackage {
             flog("DEXKIT", "查询失败 " + ck + ": " + t);
             return new String[0];
         }
+    }
+
+    // 渠道无广告闸门的形状校验: 有静态单例 m() 且有无参 boolean V()(语义=needFilterAd, 见 9.5.96 classes7
+    // LoadingAdManager$LoadingManager.a0 与 classes4 jk.a)。防 R8 短名被复用后误 hook 无关类。
+    private static boolean adGateShape(Class<?> c) {
+        try {
+            java.lang.reflect.Method v = c.getDeclaredMethod("V");
+            if (v.getReturnType() != boolean.class) return false;
+            for (java.lang.reflect.Method mm : c.getDeclaredMethods()) {
+                if (java.lang.reflect.Modifier.isStatic(mm.getModifiers()) && mm.getName().equals("m")) return true;
+            }
+        } catch (Throwable t) { }
+        return false;
     }
 
     private static void applyTabsCentering(android.view.View tabLayout) {
@@ -1828,12 +1870,6 @@ public class MainHook implements IXposedHookLoadPackage {
         return v;
     }
 
-    private static android.widget.TextView miSection(android.content.Context c, String s) {
-        android.widget.TextView tv = miText(c, s, 13, TK_TEXT_SUB, false);
-        tv.setPadding((int) (20 * miDens(c)), (int) (12 * miDens(c)), (int) (20 * miDens(c)), (int) (6 * miDens(c)));
-        return tv;
-    }
-
     private static android.widget.Switch miSwitch(android.content.Context c, boolean checked) {
         android.widget.Switch sw = new android.widget.Switch(c);
         sw.setChecked(checked);
@@ -2048,7 +2084,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
             tclp.setMargins((int) (10 * d), 0, 0, 0);
             titleCol.addView(miText(act, "CM Hook", 20, 0xFFFFFFFF, true));
-            titleCol.addView(miText(act, "网易云音乐 · 9 项开关 / 3 个工具", 12, TK_TEXT_SUB, false));
+            titleCol.addView(miText(act, "网易云音乐 · 10 项开关 / 3 个工具", 12, TK_TEXT_SUB, false));
             headRow.addView(titleCol, tclp);
             panel.addView(headRow);
 
@@ -2062,12 +2098,86 @@ public class MainHook implements IXposedHookLoadPackage {
             g1.add(miRow(act, "关注页乐迷团", "隐藏关注页「乐迷团」项", swFans));
             android.widget.Switch swLp = miSwitch(act, prefIdentifyLongPress);
             g1.add(miRow(act, "长按搜索=识曲", "顶栏搜索区长按进听歌识曲", swLp));
+            android.widget.Switch swCard = miSwitch(act, prefCardCustom);
+            g1.add(miRow(act, "抽屉VIP卡自定义", "替换抽屉顶部VIP挽回卡(图片放 files/cmhook_drawer_card.png)", swCard));
             addGroup(act, panel, d, "g1", "界面与清理", false, g1, 0);
+
+            // ---------- 抽屉VIP卡图片: 预览 + 选图 (v8.7) ----------
+            android.widget.LinearLayout cardBox = miCard(act, d);
+            android.widget.ImageView pv = new android.widget.ImageView(act);
+            pv.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+            pv.setAdjustViewBounds(true);
+            pv.setMaxHeight((int) (150 * d));
+            pv.setVisibility(android.view.View.GONE);
+            pv.setBackgroundColor(0xFF1A1A1C);
+            cardPreviewView = pv;
+            android.widget.LinearLayout.LayoutParams pvl = new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            cardBox.addView(pv, pvl);
+            android.widget.LinearLayout btns = new android.widget.LinearLayout(act);
+            btns.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            android.widget.TextView bPick = miPill(act, "选图", TK_PRIMARY, true);
+            bPick.setPadding((int) (10 * d), (int) (8 * d), (int) (10 * d), (int) (8 * d));
+            bPick.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) { cardPickPhoto(act); }
+            });
+            android.widget.TextView bEdit = miPill(act, "编辑", 0xFF5B8DEF, true);
+            bEdit.setPadding((int) (10 * d), (int) (8 * d), (int) (10 * d), (int) (8 * d));
+            bEdit.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    new Thread(new Runnable() { public void run() {
+                        android.graphics.Bitmap bm = null;
+                        try {
+                            java.io.File f = new java.io.File("/sdcard/Android/data/" + TARGET_PKG + "/files/cmhook_drawer_card.png");
+                            if (f.exists()) bm = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath());
+                        } catch (Throwable t) { }
+                        if (bm == null) { toast(act, "当前没有图片, 先选图"); return; }
+                        cardOpenEditor(act, bm);
+                    } }, "cmhook-card-edit").start();
+                }
+            });
+            android.widget.TextView bClear = miPill(act, "恢复占位", 0xFF444448, false);
+            bClear.setPadding((int) (10 * d), (int) (8 * d), (int) (10 * d), (int) (8 * d));
+            bClear.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) { cardClearImage(act); }
+            });
+            android.widget.LinearLayout.LayoutParams blp = new android.widget.LinearLayout.LayoutParams(
+                    0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            blp.setMargins((int) (8 * d), 0, (int) (4 * d), 0);
+            btns.addView(bPick, blp);
+            android.widget.LinearLayout.LayoutParams blp2 = new android.widget.LinearLayout.LayoutParams(
+                    0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            blp2.setMargins((int) (4 * d), 0, (int) (4 * d), 0);
+            btns.addView(bEdit, blp2);
+            android.widget.LinearLayout.LayoutParams blp3 = new android.widget.LinearLayout.LayoutParams(
+                    0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            blp3.setMargins((int) (4 * d), 0, (int) (8 * d), 0);
+            btns.addView(bClear, blp3);
+            android.widget.LinearLayout.LayoutParams btnsl = new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            btnsl.setMargins(0, (int) (10 * d), 0, 0);
+            cardBox.addView(btns, btnsl);
+            android.widget.TextView hint = miText(act, "选图/编辑进裁切页, 框内区域替换抽屉顶部VIP卡", 12, TK_TEXT_HINT, false);
+            hint.setPadding(0, (int) (8 * d), 0, 0);
+            cardBox.addView(hint);
+            android.widget.LinearLayout.LayoutParams cardBoxL = new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            cardBoxL.setMargins((int) (12 * d), (int) (2 * d), (int) (12 * d), 0);
+            panel.addView(cardBox, cardBoxL);
+            new Thread(new Runnable() { public void run() {
+                try {
+                    java.io.File f = new java.io.File("/sdcard/Android/data/" + TARGET_PKG + "/files/cmhook_drawer_card.png");
+                    if (f.exists()) {
+                        android.graphics.Bitmap bm = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath());
+                        if (bm != null) cardRefreshPreview(bm);
+                    }
+                } catch (Throwable t) { }
+            } }, "cmhook-card-preview").start();
 
             // ---------- 组 2: 播放与防护 ----------
             java.util.List<android.view.View> g2 = new java.util.ArrayList<android.view.View>();
             android.widget.Switch swAd = miSwitch(act, prefAdBlock);
-            g2.add(miRow(act, "去广告拦截", "开屏广告双保险", swAd));
+            g2.add(miRow(act, "去广告拦截", "开屏广告·渠道闸门+网络层+兜底", swAd));
             android.widget.Switch swRev = miSwitch(act, prefAntiRevoke);
             g2.add(miRow(act, "消息防撤回", "私信撤回可见, 原文保留", swRev));
             addGroup(act, panel, d, "g2", "播放与防护", false, g2, 1);
@@ -2151,6 +2261,12 @@ public class MainHook implements IXposedHookLoadPackage {
                 public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
                     prefIdentifyLongPress = checked; savePref(act, "identify_longpress", checked);
                     flog("SET", "长按搜索=识曲 -> " + checked);
+                }
+            });
+            swCard.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                    prefCardCustom = checked; savePref(act, "card_custom", checked);
+                    flog("SET", "抽屉VIP卡自定义 -> " + checked + (checked ? " (重进抽屉生效)" : ""));
                 }
             });
             swAd.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
@@ -2632,43 +2748,18 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void installAntiRevokeHooks(ClassLoader cl) {
-        int n = 0;
-        // ① 硬编码快路径 (9.5.96 实测: biz.c.i.m 的 a(v)/b(ab))
-        try {
-            Class<?> m = XposedHelpers.findClass("com.netease.nimlib.biz.c.i.m", cl);
-            n += hookRevokeHandlerMethod(cl, m, "a", "com.netease.nimlib.biz.e.j.v");
-            n += hookRevokeHandlerMethod(cl, m, "b", "com.netease.nimlib.biz.e.j.ab");
-        } catch (Throwable t) { }
-        if (n > 0) flog("INIT", "防撤回: 硬编码快路径 " + n + "处");
-        // ② DexKit 兜底: 类名漂移时按调用关系反查 (v22: 防撤回开关关闭 → 跳过, 不白扫 dex)
-        if (!prefAntiRevoke) {
-            flog("INIT", "防撤回: 开关关闭, 跳过 DexKit 锚点搜索");
-        } else if (n == 0) {
-            try {
-                String[] hits = dexkitFindRevokeHandlers(cl);
-                for (String h : hits) {
-                    try {
-                        int hash = h.indexOf('#');
-                        int par = h.indexOf('(', hash);
-                        Class<?> handler = cl.loadClass(h.substring(0, hash));
-                        String name = h.substring(hash + 1, par);
-                        String param = h.substring(par + 1, h.length() - 1);
-                        n += hookRevokeHandlerMethod(cl, handler, name, param);
-                    } catch (Throwable t) { }
-                }
-                if (n > 0) flog("INIT", "防撤回: DexKit兜底 " + n + "处");
-                else { flog("DEXKIT", "防撤回兜底 0 命中 → 丢缓存, 下轮重查"); dexCacheDrop("revoke"); }
-            } catch (Throwable t) {
-                flog("INIT", "防撤回 DexKit兜底失败: " + t);
-            }
-        }
-        if (n == 0) flog("INIT", "防撤回: 两层解析全部失败, 防撤回不可用(各层错误见上)");
-    }
+    // LSPosed 日志白名单: 只镜像功能/生命周期事件。协议采集类高流量标签(HTTP_*/CRONET_*/CMENC_*/SQL_PROBE/
+    // URL_NEW/CIPHER/serialdata 等)只进 cm_hook.log + HUD —— 否则刷爆 LSPosed 日志缓冲区(09-21 用户反馈)。
+    // 新增高流量标签默认不进 LSP, 需要时往这里加。
+    private static final java.util.HashSet<String> LSP_TAGS = new java.util.HashSet<String>(java.util.Arrays.asList(
+            "INIT", "SET", "DEXKIT", "ANTIREVOKE", "IDENTIFY", "TOPTABS",
+            "HOME_CLEAN", "PODCAST_CLEAN", "ADBLOCK", "FANS", "CHIP"));
 
     private static void flog(String tag, String msg) {
         String line = TS.format(new Date()) + " [" + tag + "] " + msg;
-        try { XposedBridge.log("[CMH] " + line); } catch (Throwable t) { }
+        if (LSP_TAGS.contains(tag)) {
+            try { XposedBridge.log("[CMH] " + line); } catch (Throwable t) { }
+        }
         try { hud(tag, msg); } catch (Throwable t) { }
         synchronized (LOG_LOCK) {
             try {
@@ -2747,33 +2838,6 @@ public class MainHook implements IXposedHookLoadPackage {
             return i;
         }
         return -1;
-    }
-
-    // 文件里是否含某标记(分块流式, 跨块做小 carry, 只看前 maxBytes 字节)
-    private static boolean rvFileHasMarker(File f, String marker, int maxBytes) {
-        java.io.FileInputStream in = null;
-        try {
-            byte[] mb = marker.getBytes("UTF-8");
-            byte[] buf = new byte[65536];
-            byte[] carry = new byte[Math.max(1, mb.length)];
-            int clen = 0, total = 0, n;
-            in = new java.io.FileInputStream(f);
-            while ((n = in.read(buf)) > 0) {
-                total += n;
-                byte[] comb = new byte[clen + n];
-                System.arraycopy(carry, 0, comb, 0, clen);
-                System.arraycopy(buf, 0, comb, clen, n);
-                if (rvIndexOf(comb, mb) >= 0) return true;
-                clen = Math.min(mb.length - 1, comb.length);
-                if (clen < 0) clen = 0;
-                System.arraycopy(comb, comb.length - clen, carry, 0, clen);
-                if (total > maxBytes) break;
-            }
-        } catch (Throwable t) {
-        } finally {
-            try { if (in != null) in.close(); } catch (Throwable t) { }
-        }
-        return false;
     }
 
     // v7.9: 缓存里出现"白名单之外"的 positionCode → 这份缓存是旧(未清)版本 → 该删
@@ -3516,6 +3580,459 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
+    // ===== 抽屉VIP挽回卡(方案A: 视图层替换, v8.6) =====
+    // 卡片 = 服务端资源位(positionId=118「账号页卡板」, mod_vip, 按过期VIP人群投放, 第二行内容轮换)。
+    // 文本在模块 hook 装好前已绑定(setText 探针抓不到) → 用巡检器驱动主动扫描: 全窗口找标题 TextView →
+    // 上溯锁定卡片容器(高 11%~25% 屏高 且 宽≥40% 屏宽) → 原卡 GONE + 同位插入自定义 View。
+    // 自定义图片: /sdcard/Android/data/com.netease.cloudmusic/files/cmhook_drawer_card.png
+    // (支持 png/jpg/webp; 无图时显示模块占位卡)。
+    private static final Object CARD_LOCK = new Object();
+    private static final int CARD_PICK_REQ = 0x434D;           // 相册选图 requestCode ('CM')
+    private static volatile boolean cardReplaced = false;      // 本次进程已替换(替换后停止扫描)
+    private static volatile java.lang.ref.WeakReference<android.view.View> cardAppliedRef = null; // 已替换的卡片容器
+    private static android.widget.ImageView cardPreviewView;  // 设置面板里的预览控件(对话框存续期有效)
+    private static android.graphics.Bitmap cardBitmap;         // 自定义图缓存
+    private static boolean cardBitmapTried = false;
+    private static long cardLastMissLog = 0;
+
+    private static boolean isVipCardText(String t) {
+        if (t == null || t.length() == 0 || t.length() > 40) return false;
+        return t.contains("期待您的回归") || t.contains("特权已失效") || t.contains("续费立享")
+                || t.contains("会员特权") || t.contains("每日打卡") || t.contains("学生特惠")
+                || t.contains("优惠开通") || t.contains("立享优惠");
+    }
+
+    private static void cardSweepTick() {
+        if (!prefCardCustom || cardReplaced || !cmForeground) return;
+        try {
+            for (android.view.View r : allWindowRoots()) {
+                if (cardReplaced) return;
+                cardScan(r, 0);
+            }
+        } catch (Throwable t) { }
+    }
+
+    private static void cardScan(android.view.View v, int depth) {
+        if (v == null || cardReplaced || depth > 60) return;
+        if (v instanceof android.widget.TextView) {
+            try {
+                CharSequence cs = ((android.widget.TextView) v).getText();
+                if (isVipCardText(cs == null ? null : cs.toString())) {
+                    replaceVipCard((android.widget.TextView) v);
+                    return;
+                }
+            } catch (Throwable t) { }
+        }
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = g.getChildCount() - 1; i >= 0; i--) {
+                if (cardReplaced) return;
+                cardScan(g.getChildAt(i), depth + 1);
+            }
+        }
+    }
+
+    private static android.graphics.Bitmap cardBitmap() {
+        synchronized (CARD_LOCK) {
+            if (cardBitmap != null || cardBitmapTried) return cardBitmap;
+            cardBitmapTried = true;
+            String[] cands = {"cmhook_drawer_card.png", "cmhook_drawer_card.jpg", "cmhook_drawer_card.webp"};
+            for (String nm : cands) {
+                try {
+                    java.io.File f = new java.io.File("/sdcard/Android/data/" + TARGET_PKG + "/files/" + nm);
+                    if (!f.exists() || f.length() == 0) continue;
+                    android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+                    o.inJustDecodeBounds = true;
+                    android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), o);
+                    int sample = 1;
+                    while (o.outWidth / sample > 1080) sample *= 2;
+                    android.graphics.BitmapFactory.Options o2 = new android.graphics.BitmapFactory.Options();
+                    o2.inSampleSize = sample;
+                    cardBitmap = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), o2);
+                    if (cardBitmap != null) { flog("CARDCUSTOM", "自定义图已加载: " + nm + " " + cardBitmap.getWidth() + "x" + cardBitmap.getHeight()); break; }
+                } catch (Throwable t) { flog("CARDCUSTOM", "图片加载失败 " + nm + ": " + t); }
+            }
+            if (cardBitmap == null) flog("CARDCUSTOM", "未提供自定义图(files/cmhook_drawer_card.png), 使用占位卡");
+            return cardBitmap;
+        }
+    }
+
+    private static void replaceVipCard(android.widget.TextView tv) {
+        try {
+            android.view.View card = null;
+            android.view.View cur = tv;
+            int sh = tv.getResources().getDisplayMetrics().heightPixels;
+            int sw = tv.getResources().getDisplayMetrics().widthPixels;
+            StringBuilder chain = new StringBuilder();
+            for (int i = 0; i < 10 && cur != null; i++) {
+                chain.append(" <").append(cur.getClass().getSimpleName()).append(' ')
+                     .append(cur.getWidth()).append('x').append(cur.getHeight()).append('>');
+                int h = cur.getHeight(), w = cur.getWidth();
+                if (h >= sh * 0.11f && h <= sh * 0.25f && w >= sw * 0.4f) { card = cur; break; }
+                android.view.ViewParent vp = cur.getParent();
+                cur = vp instanceof android.view.View ? (android.view.View) vp : null;
+            }
+            if (card == null) {
+                long now = System.currentTimeMillis();
+                if (now - cardLastMissLog > 60000L) {
+                    cardLastMissLog = now;
+                    flog("CARDCUSTOM", "容器未锁定(阈值未命中) 链:" + chain);
+                }
+                return;
+            }
+            if ("cmhook_vipcard_done".equals(card.getTag())) { cardReplaced = true; return; }
+            int cw = card.getWidth(), ch = card.getHeight();
+            if (cw <= 0 || ch <= 0) { flog("CARDCUSTOM", "容器未测量(" + cw + "x" + ch + "), 下轮再试"); return; }
+            flog("CARDCUSTOM", "锁定容器 " + card.getClass().getName() + " " + cw + "x" + ch + " 链:" + chain + " → 覆盖替换");
+            float den = card.getResources().getDisplayMetrics().density;
+            // 主手段: setForeground —— foreground 永远绘制在所有子视图之上, 与 RN 的 zIndex/绘制顺序无关
+            // (ReactViewGroup 自定义绘制顺序会让普通子视图盖不住原内容, 实测)。反射调用绕过旧编译桩。
+            android.graphics.Bitmap bm = cardBitmap();
+            try {
+                invoke1(card, "setForeground", cardMakeDrawable(card, bm));
+                card.setTag("cmhook_vipcard_done");
+                cardAppliedRef = new java.lang.ref.WeakReference<android.view.View>(card);
+                cardReplaced = true;
+                flog("ADBLOCK", "抽屉VIP挽回卡已替换(foreground)");
+                return;
+            } catch (Throwable tf) { flog("CARDCUSTOM", "setForeground 失败, 回退子视图覆盖: " + tf); }
+            // 回退: 原地覆盖 —— 自定义卡作为最后一个子视图塞进容器, 像素尺寸精确铺满
+            android.widget.FrameLayout slot = new android.widget.FrameLayout(card.getContext());
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setColor(0xFF262629);
+            bg.setCornerRadius(12 * den);
+            slot.setBackground(bg);
+            if (bm != null) {
+                android.widget.ImageView iv = new android.widget.ImageView(card.getContext());
+                iv.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+                iv.setImageBitmap(bm);
+                int pad = (int) (6 * den);
+                iv.setPadding(pad, pad, pad, pad);
+                slot.addView(iv, new android.widget.FrameLayout.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+            } else {
+                android.widget.TextView ph = new android.widget.TextView(card.getContext());
+                ph.setText("CM Hook · 自定义卡片位\n图片放 files/cmhook_drawer_card.png");
+                ph.setTextSize(14);
+                ph.setGravity(android.view.Gravity.CENTER);
+                ph.setTextColor(0x80FFFFFF);
+                slot.addView(ph, new android.widget.FrameLayout.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+            }
+            slot.setClickable(true);
+            ((android.view.ViewGroup) card).addView(slot, new android.view.ViewGroup.LayoutParams(cw, ch));
+            card.setTag("cmhook_vipcard_done");
+            cardReplaced = true;
+            flog("ADBLOCK", "抽屉VIP挽回卡已替换为自定义内容");
+        } catch (Throwable t) { flog("CARDCUSTOM", "替换失败: " + t); }
+    }
+
+    // 卡片前景 Drawable: 有图=铺满位图, 无图=深色圆角占位
+    private static android.graphics.drawable.Drawable cardMakeDrawable(android.view.View v, android.graphics.Bitmap bm) {
+        if (bm != null) {
+            android.graphics.drawable.BitmapDrawable bd = new android.graphics.drawable.BitmapDrawable(v.getResources(), bm);
+            bd.setGravity(android.view.Gravity.FILL);
+            return bd;
+        }
+        float den = v.getResources().getDisplayMetrics().density;
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setColor(0xFF262629);
+        g.setCornerRadius(12 * den);
+        return g;
+    }
+
+    // 面板"选择图片": 借宿主 Activity 发起系统相册选图, 结果由 dispatchActivityResult 探针接住
+    private static void cardPickPhoto(final android.app.Activity act) {
+        try {
+            android.content.Intent it = new android.content.Intent(android.content.Intent.ACTION_PICK,
+                    android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+            act.startActivityForResult(it, CARD_PICK_REQ);
+        } catch (Throwable t) {
+            flog("CARDCUSTOM", "启动相册失败: " + t);
+            toast(act, "无法启动相册: " + t);
+        }
+    }
+
+    // 面板"恢复占位": 删除自定义图, 已替换的卡重设为深色占位
+    private static void cardClearImage(final android.app.Activity act) {
+        try {
+            String[] cands = {"cmhook_drawer_card.png", "cmhook_drawer_card.jpg", "cmhook_drawer_card.webp"};
+            for (String nm : cands) {
+                try { new java.io.File("/sdcard/Android/data/" + TARGET_PKG + "/files/" + nm).delete(); } catch (Throwable t) { }
+            }
+        } catch (Throwable t) { }
+        synchronized (CARD_LOCK) { cardBitmap = null; cardBitmapTried = true; }
+        cardApplyToExisting(act, null);
+        cardRefreshPreview(null);
+        toast(act, "已恢复占位卡");
+    }
+
+    // 相册回传: 读流 → 校验可解码 → 落盘约定路径 → 刷新缓存/预览/已替换卡片
+    private static void cardSaveFromUri(final android.app.Activity act, final android.net.Uri uri) {
+        new Thread(new Runnable() { public void run() {
+            try {
+                java.io.InputStream in = act.getContentResolver().openInputStream(uri);
+                if (in == null) throw new IllegalStateException("打开图片流失败");
+                java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[16384];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    bos.write(buf, 0, n);
+                    if (bos.size() > 25 * 1024 * 1024) { in.close(); throw new IllegalStateException("图片超过25MB"); }
+                }
+                in.close();
+                byte[] bytes = bos.toByteArray();
+                android.graphics.Bitmap check = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                if (check == null) throw new IllegalStateException("所选内容不是有效图片");
+                flog("CARDCUSTOM", "选图已解码 " + check.getWidth() + "x" + check.getHeight() + " → 进入裁切编辑页");
+                // 主线程打开编辑页(dispatchActivityResult 本就在主线程)
+                cardOpenEditor(act, check);
+            } catch (final Throwable t) {
+                flog("CARDCUSTOM", "选图保存失败: " + t);
+                toast(act, "选图失败: " + t.getMessage());
+            }
+        } }, "cmhook-card-save").start();
+    }
+
+    // 把(可能新的)图即时刷进已替换的卡片; bm=null → 占位
+    private static void cardApplyToExisting(final android.app.Activity act, final android.graphics.Bitmap bm) {
+        try {
+            final android.view.View c = cardAppliedRef == null ? null : cardAppliedRef.get();
+            if (c == null) return;
+            final android.graphics.drawable.Drawable fg = cardMakeDrawable(c, bm);
+            c.post(new Runnable() { public void run() {
+                try { invoke1(c, "setForeground", fg); } catch (Throwable t) { }
+            }});
+        } catch (Throwable t) { }
+    }
+
+    // 面板预览刷新(主线程)
+    private static void cardRefreshPreview(final android.graphics.Bitmap bm) {
+        if (cardPreviewView == null) return;
+        android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        h.post(new Runnable() { public void run() {
+            try {
+                if (cardPreviewView == null) return;
+                if (bm != null) { cardPreviewView.setImageBitmap(bm); cardPreviewView.setVisibility(0); }
+                else cardPreviewView.setVisibility(8);
+            } catch (Throwable t) { }
+        }});
+    }
+
+    // ===== 抽屉VIP卡: 裁切编辑页 (v8.8) =====
+    // 选图/编辑都先进全屏编辑页: 图在卡片比例(1040x448)的裁切框内拖动+双指缩放, 确认后按框裁切
+    // 输出 1040x448 PNG 并走保存→缓存→预览→已替换卡 四连刷新。纯 View 自绘, 无第三方依赖。
+    private static final float CARD_RATIO = 1040f / 448f;
+
+    private static void cardOpenEditor(final android.app.Activity act, final android.graphics.Bitmap src) {
+        if (src == null) { toast(act, "没有可编辑的图片"); return; }
+        // Dialog/ScaleGestureDetector(Handler) 必须建在主线程; 本函数会被选图保存/编辑按钮的后台线程调用
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() { public void run() {
+                cardOpenEditor(act, src);
+            }});
+            return;
+        }
+        try {
+            final float d = miDens(act);
+            final android.widget.FrameLayout root = new android.widget.FrameLayout(act);
+            root.setBackgroundColor(0xFF101012);
+            final CardCropView cv = new CardCropView(act);
+            cv.setBitmap(src);
+            root.addView(cv, new android.widget.FrameLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+            android.widget.TextView hint = miText(act, "拖动 / 双指缩放 · 框内为卡片显示区域", 13, 0x80FFFFFF, false);
+            android.widget.FrameLayout.LayoutParams hintL = new android.widget.FrameLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                    android.view.Gravity.TOP | android.view.Gravity.CENTER_HORIZONTAL);
+            hintL.setMargins(0, (int) (40 * d), 0, 0);
+            root.addView(hint, hintL);
+            android.widget.LinearLayout bar = new android.widget.LinearLayout(act);
+            bar.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            android.widget.TextView bCancel = miPill(act, "取消", 0xFF3A3A3E, true);
+            android.widget.TextView bOk = miPill(act, "确认裁切", TK_PRIMARY, true);
+            android.widget.LinearLayout.LayoutParams cl = new android.widget.LinearLayout.LayoutParams(
+                    0, (int) (46 * d), 1f);
+            cl.setMargins((int) (8 * d), 0, (int) (6 * d), 0);
+            bar.addView(bCancel, cl);
+            android.widget.LinearLayout.LayoutParams ol = new android.widget.LinearLayout.LayoutParams(
+                    0, (int) (46 * d), 1.4f);
+            ol.setMargins((int) (6 * d), 0, (int) (8 * d), 0);
+            bar.addView(bOk, ol);
+            android.widget.FrameLayout.LayoutParams barL = new android.widget.FrameLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                    android.view.Gravity.BOTTOM);
+            barL.setMargins((int) (20 * d), 0, (int) (20 * d), (int) (34 * d));
+            root.addView(bar, barL);
+            final android.app.Dialog dlg = new android.app.Dialog(act);
+            dlg.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+            android.view.Window w = dlg.getWindow();
+            if (w != null) {
+                w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0xFF101012));
+                android.view.WindowManager.LayoutParams wlp = w.getAttributes();
+                wlp.dimAmount = 0f;
+                w.setAttributes(wlp);
+                try { invoke1(w, "setStatusBarColor", 0xFF101012); } catch (Throwable t1) { }
+                try { invoke1(w, "setNavigationBarColor", 0xFF101012); } catch (Throwable t1) { }
+            }
+            dlg.setContentView(root, new android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+            bCancel.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) { dlg.dismiss(); }
+            });
+            bOk.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    android.graphics.Bitmap out = cv.crop();
+                    if (out == null) { toast(act, "裁切失败"); return; }
+                    try {
+                        java.io.File dst = new java.io.File("/sdcard/Android/data/" + TARGET_PKG + "/files/cmhook_drawer_card.png");
+                        java.io.FileOutputStream fo = new java.io.FileOutputStream(dst);
+                        out.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fo);
+                        fo.close();
+                        synchronized (CARD_LOCK) { cardBitmap = out; cardBitmapTried = true; }
+                        cardApplyToExisting(act, out);
+                        cardRefreshPreview(out);
+                        toast(act, "已裁切保存 " + out.getWidth() + "x" + out.getHeight());
+                        flog("CARDCUSTOM", "编辑页裁切已保存 " + out.getWidth() + "x" + out.getHeight());
+                    } catch (Throwable t) { toast(act, "保存失败: " + t); }
+                    dlg.dismiss();
+                }
+            });
+            dlg.show();
+        } catch (Throwable t) { flog("CARDCUSTOM", "打开编辑页失败: " + t); toast(act, "打开编辑页失败: " + t); }
+    }
+
+    // 卡片比例裁切视图: 图可拖动/双指缩放, 暗色遮罩外+白色框内, crop() 按框裁源图输出 1040x448
+    public static class CardCropView extends android.view.View {
+        private android.graphics.Bitmap src;
+        private final android.graphics.Matrix m = new android.graphics.Matrix();
+        private final android.graphics.RectF frame = new android.graphics.RectF();
+        private final android.graphics.Paint dim = new android.graphics.Paint();
+        private final android.graphics.Paint stroke = new android.graphics.Paint();
+        private final android.graphics.Paint bmpPaint = new android.graphics.Paint();
+        private final android.view.ScaleGestureDetector sgd;
+        private final android.graphics.PointF last = new android.graphics.PointF();
+        private final float mar;
+        private final float reserve;
+
+        public CardCropView(android.content.Context c) {
+            super(c);
+            float d = c.getResources().getDisplayMetrics().density;
+            mar = 28 * d;
+            reserve = 150 * d;
+            dim.setColor(0xB3000000);
+            stroke.setColor(0xFFFFFFFF);
+            stroke.setStyle(android.graphics.Paint.Style.STROKE);
+            stroke.setStrokeWidth(Math.max(2f, 2 * d));
+            bmpPaint.setFilterBitmap(true);
+            sgd = new android.view.ScaleGestureDetector(c, new android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                @Override
+                public boolean onScale(android.view.ScaleGestureDetector detector) {
+                    m.postScale(detector.getScaleFactor(), detector.getScaleFactor(), detector.getFocusX(), detector.getFocusY());
+                    clamp(); invalidate(); return true;
+                }
+            });
+            setOnTouchListener(new android.view.View.OnTouchListener() {
+                @Override
+                public boolean onTouch(android.view.View v, android.view.MotionEvent ev) {
+                    sgd.onTouchEvent(ev);
+                    switch (ev.getActionMasked()) {
+                        case android.view.MotionEvent.ACTION_DOWN:
+                            last.set(ev.getX(), ev.getY()); break;
+                        case android.view.MotionEvent.ACTION_MOVE:
+                            if (!sgd.isInProgress()) {
+                                m.postTranslate(ev.getX() - last.x, ev.getY() - last.y);
+                                clamp(); invalidate();
+                            }
+                            last.set(ev.getX(), ev.getY()); break;
+                        default: break;
+                    }
+                    return true;
+                }
+            });
+        }
+
+        public void setBitmap(android.graphics.Bitmap b) { src = b; layoutFrame(); fit(); invalidate(); }
+
+        @Override
+        protected void onSizeChanged(int w, int h, int ow, int oh) { layoutFrame(); fit(); invalidate(); }
+
+        private void layoutFrame() {
+            int w = getWidth(), h = getHeight();
+            if (w <= 0 || h <= 0) return;
+            float availH = h - 2 * mar - reserve;
+            float fw = Math.min(w - 2 * mar, availH * CARD_RATIO);
+            float fh = fw / CARD_RATIO;
+            float left = (w - fw) / 2f;
+            float top = mar + Math.max(0f, (availH - fh) / 2f);
+            frame.set(left, top, left + fw, top + fh);
+        }
+
+        private void fit() {
+            if (src == null || frame.isEmpty()) return;
+            float sc = Math.max(frame.width() / src.getWidth(), frame.height() / src.getHeight());
+            m.reset();
+            m.postScale(sc, sc);
+            m.postTranslate(frame.centerX() - src.getWidth() * sc / 2f, frame.centerY() - src.getHeight() * sc / 2f);
+            clamp(); invalidate();
+        }
+
+        // 保证图始终盖住裁切框: 不够盖的方向锁居中, 够盖的方向平移不得露框
+        private void clamp() {
+            if (src == null || frame.isEmpty()) return;
+            float[] v = new float[9];
+            m.getValues(v);
+            float sc = v[android.graphics.Matrix.MSCALE_X];
+            float sw = src.getWidth() * sc, sh = src.getHeight() * sc;
+            float tx = v[android.graphics.Matrix.MTRANS_X], ty = v[android.graphics.Matrix.MTRANS_Y];
+            tx = sw >= frame.width() ? Math.min(Math.max(tx, frame.left + frame.width() - sw), frame.left)
+                                     : frame.centerX() - sw / 2f;
+            ty = sh >= frame.height() ? Math.min(Math.max(ty, frame.top + frame.height() - sh), frame.top)
+                                      : frame.centerY() - sh / 2f;
+            v[android.graphics.Matrix.MTRANS_X] = tx;
+            v[android.graphics.Matrix.MTRANS_Y] = ty;
+            if (sc < Math.max(frame.width() / src.getWidth(), frame.height() / src.getHeight())) {
+                float minSc = Math.max(frame.width() / src.getWidth(), frame.height() / src.getHeight());
+                v[android.graphics.Matrix.MSCALE_X] = minSc;
+                v[android.graphics.Matrix.MSCALE_Y] = minSc;
+            }
+            m.setValues(v);
+        }
+
+        @Override
+        protected void onDraw(android.graphics.Canvas c) {
+            super.onDraw(c);
+            if (src == null || frame.isEmpty()) return;
+            int save = c.save();
+            c.concat(m);
+            c.drawBitmap(src, 0, 0, bmpPaint);
+            c.restoreToCount(save);
+            c.drawRect(0, 0, getWidth(), frame.top, dim);
+            c.drawRect(0, frame.bottom, getWidth(), getHeight(), dim);
+            c.drawRect(0, frame.top, frame.left, frame.bottom, dim);
+            c.drawRect(frame.right, frame.top, getWidth(), frame.bottom, dim);
+            c.drawRoundRect(frame, 12, 12, stroke);
+        }
+
+        // 按框裁源图 → 1040x448 输出
+        public android.graphics.Bitmap crop() {
+            if (src == null || frame.isEmpty()) return null;
+            android.graphics.Matrix inv = new android.graphics.Matrix(m);
+            inv.invert(inv);
+            android.graphics.RectF srcRect = new android.graphics.RectF(frame);
+            inv.mapRect(srcRect);
+            float l = Math.max(0, srcRect.left), t = Math.max(0, srcRect.top);
+            float r = Math.min(src.getWidth(), srcRect.right), b = Math.min(src.getHeight(), srcRect.bottom);
+            if (r <= l || b <= t) return null;
+            android.graphics.RectF s = new android.graphics.RectF(l, t, r, b);
+            android.graphics.Bitmap out = android.graphics.Bitmap.createBitmap(1040, 448, android.graphics.Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas c = new android.graphics.Canvas(out);
+            c.drawBitmap(src, new android.graphics.Rect((int) s.left, (int) s.top, (int) s.right, (int) s.bottom),
+                    new android.graphics.Rect(0, 0, 1040, 448), bmpPaint);
+            return out;
+        }
+    }
+
     private static void startRvWatcher() {
         if (rvWatcherStarted) return;
         rvWatcherStarted = true;
@@ -3527,6 +4044,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         android.app.Activity a = rvTopActivity();
                         if (a != null) rvDiffAndShow(a);
                     } catch (Throwable t) { }
+                    try { cardSweepTick(); } catch (Throwable t) { }   // v8.6: 抽屉VIP卡替换扫描
                     try { h.postDelayed(this, 1500L); } catch (Throwable t) { }
                 }
             }, 1500L);
@@ -3862,339 +4380,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         } catch (Throwable t) { }
         return out;
-    }
-
-    // 按资源名查找: 先当前 Activity 窗口, 再所有窗口根(深度放宽到 80)
-    private static android.view.View findByResourceName(android.app.Activity act, String name) {
-        try {
-            android.view.View v = findByName(act.getWindow().getDecorView(), name, 0);
-            if (v != null) return v;
-        } catch (Throwable t) { }
-        java.util.List<android.view.View> roots = allWindowRoots();
-        try { flog("IDENTIFY", "窗口根数=" + roots.size()); } catch (Throwable t) { }
-        for (int i = 0; i < roots.size(); i++) {
-            android.view.View v = findByName(roots.get(i), name, 0);
-            if (v != null) {
-                try { flog("IDENTIFY", "在窗口#" + i + " " + roots.get(i).getClass().getName() + " 命中"); } catch (Throwable t) { }
-                return v;
-            }
-        }
-        return null;
-    }
-
-    private static android.view.View findByName(android.view.View v, String name, int depth) {
-        if (v == null || depth > 80) return null;
-        try {
-            int id = v.getId();
-            if (id != 0) {
-                try {
-                    String rn = v.getResources().getResourceName(id);
-                    if (rn != null && rn.endsWith(":id/" + name)) return v;
-                } catch (Throwable t) { }
-            }
-            if (v instanceof android.view.ViewGroup) {
-                android.view.ViewGroup g = (android.view.ViewGroup) v;
-                for (int i = 0; i < g.getChildCount(); i++) {
-                    android.view.View r = findByName(g.getChildAt(i), name, depth + 1);
-                    if (r != null) return r;
-                }
-            }
-        } catch (Throwable t) { }
-        return null;
-    }
-
-    // v29: 右上角图标可能不是 searchIcon(顶栏形态会切换) → 按 id 名 / 最右 ImageView 找锚点
-    private static android.view.View findTopbarAnchor(android.app.Activity act, android.content.res.Resources res, String pkg) {
-        int id = 0;
-        try { id = res.getIdentifier("iv_custom_theme_icon", "id", pkg); } catch (Throwable t) { }
-        if (id != 0) { try { android.view.View v = act.findViewById(id); if (v != null) return v; } catch (Throwable t) { } }
-        try {
-            java.util.List<android.view.View> roots = allWindowRoots();
-            for (int i = 0; i < roots.size(); i++) {
-                java.util.List<android.widget.ImageView> ivs = new java.util.ArrayList<android.widget.ImageView>();
-                collectImageViews(roots.get(i), ivs, 0);
-                android.widget.ImageView best = null;
-                int bestRight = -1;
-                for (int j = 0; j < ivs.size(); j++) {
-                    android.widget.ImageView c = ivs.get(j);
-                    if (c.getVisibility() != android.view.View.VISIBLE || c.getWidth() <= 0) continue;
-                    int[] loc = new int[2];
-                    c.getLocationOnScreen(loc);
-                    if (loc[1] > 300) continue;                       // 只认顶栏区
-                    if (loc[0] + c.getWidth() > bestRight) { bestRight = loc[0] + c.getWidth(); best = c; }
-                }
-                if (best != null) return best;
-            }
-        } catch (Throwable t) { }
-        return null;
-    }
-
-    // 收集子树里的 ImageView(用于复制顶栏图标的着色)
-    private static void collectImageViews(android.view.View v, java.util.List<android.widget.ImageView> out, int depth) {
-        if (v == null || depth > 30) return;
-        try {
-            if (v instanceof android.widget.ImageView) out.add((android.widget.ImageView) v);
-            if (v instanceof android.view.ViewGroup) {
-                android.view.ViewGroup g = (android.view.ViewGroup) v;
-                for (int i = 0; i < g.getChildCount(); i++) collectImageViews(g.getChildAt(i), out, depth + 1);
-            }
-        } catch (Throwable t) { }
-    }
-
-    // 顶栏夜间为深色背景 → 复制顶栏里已有图标的 ColorFilter, 否则兜底白色
-    private static void applyTopbarTint(android.view.View anchor, android.widget.ImageView iv) {
-        try {
-            java.util.ArrayList<android.widget.ImageView> ivs = new java.util.ArrayList<android.widget.ImageView>();
-            android.view.View root = null;
-            try { root = (android.view.View) anchor.getParent(); } catch (Throwable t) { }
-            if (root == null) root = anchor;
-            collectImageViews(root, ivs, 0);
-            android.graphics.ColorFilter cf = null;
-            for (int i = 0; i < ivs.size(); i++) {
-                android.widget.ImageView src = ivs.get(i);
-                if (src == iv) continue;
-                if (src.getColorFilter() != null) { cf = src.getColorFilter(); break; }
-            }
-            if (cf != null) { iv.setColorFilter(cf); flog("IDENTIFY", "图标着色: 复用顶栏 ColorFilter"); }
-            else { iv.setColorFilter(0xFFFFFFFF); flog("IDENTIFY", "图标着色: 兜底白色"); }
-        } catch (Throwable t) { }
-    }
-
-    // v45: 全窗口按 id 数值查找(当前 Activity 窗口找不到时遍历其它窗口根)
-    private static android.view.View findInAllWindows(android.app.Activity act, int id) {
-        if (id == 0) return null;
-        try { android.view.View v = act.findViewById(id); if (v != null) return v; } catch (Throwable t) { }
-        try {
-            java.util.List<android.view.View> roots = allWindowRoots();
-            for (int i = 0; i < roots.size(); i++) {
-                try {
-                    android.view.View v = roots.get(i).findViewById(id);
-                    if (v != null) { flog("IDENTIFY", "窗口#" + i + " 命中 id=0x" + Integer.toHexString(id)); return v; }
-                } catch (Throwable t) { }
-            }
-        } catch (Throwable t) { }
-        return null;
-    }
-
-    // v44: 顶部右侧功能区(funContainer)内, 在搜索图标**右侧**插入"红色圆形识曲按钮"(仿 postBtn 样式)
-    private static final String IDENTIFY_BTN_TAG = "cmhook_identify_btn";
-
-    private static boolean installIdentifyButton(final android.app.Activity act, android.content.res.Resources res, String pkg) {
-        try {
-            int sid = 0, fid = 0;
-            try { sid = res.getIdentifier("searchIcon", "id", pkg); } catch (Throwable t) { }
-            try { fid = res.getIdentifier("funContainer", "id", pkg); } catch (Throwable t) { }
-            android.view.View search = findInAllWindows(act, sid);
-            if (search == null) search = findByResourceName(act, "searchIcon");
-            android.view.View fun = findInAllWindows(act, fid);
-            if (fun == null) fun = findByResourceName(act, "funContainer");
-            // 锚点优先级: searchIcon 的父容器 → searchIcon 本身 → funContainer
-            if (search == null && fun == null) { flog("IDENTIFY", "红按钮: 未找到 searchIcon/funContainer"); return false; }
-            if (search == null) {
-                // 无搜索图标: 退化为"插到 funContainer 内最右(即 postBtn 之后)"
-                search = fun;
-            }
-            android.view.ViewParent vp = search.getParent();
-            if (!(vp instanceof android.view.ViewGroup)) return false;
-            final android.view.ViewGroup parent = (android.view.ViewGroup) vp;
-            if (parent.findViewWithTag(IDENTIFY_BTN_TAG) != null) return true;   // 幂等
-
-            float d = res.getDisplayMetrics().density;
-            int size = search.getWidth() > 0 ? search.getWidth() : (int) (26 * d);   // 与搜索图标同尺寸(实测 77px)
-            // 红色圆底
-            final android.widget.FrameLayout btn = new android.widget.FrameLayout(act);
-            android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
-            g.setShape(android.graphics.drawable.GradientDrawable.OVAL);
-            g.setColor(0xFFEC4141);
-            btn.setBackground(g);
-            // 白色识曲图标
-            final android.widget.ImageView ic = new android.widget.ImageView(act);
-            int rid = res.getIdentifier("identify_widget_icn_new", "drawable", pkg);
-            if (rid == 0) rid = res.getIdentifier("shortcut_identify", "drawable", pkg);
-            if (rid != 0) ic.setImageResource(rid);
-            else ic.setImageResource(android.R.drawable.ic_btn_speak_now);
-            ic.setColorFilter(0xFFFFFFFF);
-            int isz = (int) (size * 0.60f);
-            android.widget.FrameLayout.LayoutParams ilp = new android.widget.FrameLayout.LayoutParams(isz, isz, android.view.Gravity.CENTER);
-            btn.addView(ic, ilp);
-            android.view.ViewGroup.LayoutParams lp = (parent instanceof android.widget.LinearLayout)
-                    ? (android.view.ViewGroup.LayoutParams) new android.widget.LinearLayout.LayoutParams(size, size)
-                    : new android.view.ViewGroup.LayoutParams(size, size);
-            btn.setLayoutParams(lp);
-            btn.setTag(IDENTIFY_BTN_TAG);
-            btn.setContentDescription("听歌识曲");
-            btn.setClickable(true);
-            btn.setOnClickListener(new android.view.View.OnClickListener() {
-                public void onClick(android.view.View v) { startIdentify(act); }
-            });
-            int idx = parent.indexOfChild(search);
-            int at = (search == fun) ? parent.getChildCount() : Math.min(idx + 1, parent.getChildCount());
-            parent.addView(btn, at);                    // v45: 插到"搜索右侧"(无搜索图标时追加到功能区末尾)
-            flog("IDENTIFY", "已插入红色识曲按钮(搜索右侧): 容器=" + parent.getClass().getName()
-                + " size=" + size + " idx=" + at + "/" + parent.getChildCount());
-            return true;
-        } catch (Throwable t) { flog("IDENTIFY", "红色按钮插入失败: " + t); return false; }
-    }
-
-    // v46: 首页顶栏(RN 渲染)在 onResume 时往往还没出 → 开观察窗口周期重试
-    private static void startIdentifyEntryWatcher(final android.app.Activity act) {
-        try {
-            android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
-            for (int i = 1; i <= 30; i++) {
-                final int k = i;
-                h.postDelayed(new Runnable() {
-                    public void run() { try { installIdentifyEntry(act); } catch (Throwable t) { } }
-                }, 700L * i);
-            }
-        } catch (Throwable t) { }
-    }
-
-    // 只在首页(MainActivity 且顶栏含 searchIcon)上装, 幂等
-    // v24: 上一版只靠 getIdentifier, 解析不到时静默 return(零日志) —— 改三路查找 + 时序重试
-    private static void installIdentifyEntry(final android.app.Activity act) {
-        installIdentifyEntry(act, 0);
-    }
-
-    private static void installIdentifyEntry(final android.app.Activity act, final int attempt) {
-        // v48: 顶栏按钮方案已废弃(首页搜索图标是 RN 自绘节点, 无法定位插入) —— 改为长按搜索区
-        if (true) return;
-        try {
-            android.content.res.Resources res = act.getResources();
-            final String pkg = act.getPackageName();
-            int sid = 0;
-            try { sid = res.getIdentifier("searchIcon", "id", pkg); } catch (Throwable t) { }
-            android.view.View search = (sid != 0) ? act.findViewById(sid) : null;
-            if (search == null) { try { search = act.findViewById(0x7f09319b); } catch (Throwable t) { } }   // 9.5.96 实测 id
-            if (search == null) search = findByResourceName(act, "searchIcon");
-            // v26: 顶栏形态随滚动变化(滚动后 searchIcon 会被换掉) → 兜底插到 top_header 右侧
-            android.view.View header = null;
-            if (search == null) {
-                try { int hid = res.getIdentifier("top_header", "id", pkg); if (hid != 0) header = act.findViewById(hid); } catch (Throwable t) { }
-                if (header == null) header = findByResourceName(act, "top_header");
-                if (header != null) {
-                    StringBuilder kids = new StringBuilder();
-                    if (header instanceof android.view.ViewGroup) {
-                        android.view.ViewGroup hg0 = (android.view.ViewGroup) header;
-                        for (int i = 0; i < hg0.getChildCount() && i < 8; i++) {
-                            android.view.View c0 = hg0.getChildAt(i);
-                            kids.append(c0.getClass().getSimpleName()).append("[w=").append(c0.getWidth()).append("] ");
-                        }
-                    }
-                    flog("IDENTIFY", "顶栏兜底: " + header.getClass().getName() + " 子视图: " + kids);
-                }
-            }
-            if (search == null && header == null) {
-                if (attempt < 5) {
-                    final android.app.Activity a2 = act;
-                    new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
-                        public void run() { installIdentifyEntry(a2, attempt + 1); }
-                    }, 400L * (attempt + 1));
-                } else {
-                    flog("IDENTIFY", "放弃: 未找到 searchIcon (getIdentifier=" + sid + ", attempt=" + attempt + ")");
-                }
-                return;
-            }
-            flog("IDENTIFY", "锚点 attempt=" + attempt + " → " + (search != null ? search.getClass().getName() : "无 searchIcon(走顶栏兜底)"));
-            // ① 长按搜索 → 识曲 (v26: search 为空时跳过, 走顶栏兜底)
-            if (search != null && !IDENTIFY_TAG.equals(search.getTag())) {
-                search.setTag(IDENTIFY_TAG);
-                search.setOnLongClickListener(new android.view.View.OnLongClickListener() {
-                    public boolean onLongClick(android.view.View v) {
-                        startIdentify(act);
-                        return true;
-                    }
-                });
-                flog("IDENTIFY", "已挂: 长按搜索图标 → 听歌识曲");
-            }
-            // ② v44: 首选"红色圆形按钮"方案(搜索图标左侧), 成功则不再走旧的白色小图标方案
-            if (installIdentifyButton(act, res, pkg)) {
-                if (!IDENTIFY_TAG.equals(search.getTag())) {
-                    search.setTag(IDENTIFY_TAG);
-                    search.setOnLongClickListener(new android.view.View.OnLongClickListener() {
-                        public boolean onLongClick(android.view.View v) { startIdentify(act); return true; }
-                    });
-                    flog("IDENTIFY", "已挂: 长按搜索图标 → 听歌识曲");
-                }
-                return;
-            }
-            // ② 插入识曲图标: 锚点 = 搜索图标(存在时) 否则右上角图标; 位置 = 锚点左侧, 尺寸 = 锚点同尺寸
-            android.view.View anchor = search;
-            if (anchor == null) anchor = findTopbarAnchor(act, res, pkg);
-            if (anchor != null) {
-                flog("IDENTIFY", "锚点=右上角图标 " + anchor.getClass().getName() + " " + anchor.getWidth() + "x" + anchor.getHeight());
-            }
-            android.view.ViewParent vp0 = (anchor != null) ? anchor.getParent() : null;
-            if (vp0 == null && header instanceof android.view.ViewGroup) {
-                android.view.ViewGroup hg = (android.view.ViewGroup) header;
-                android.view.ViewGroup host = null;
-                for (int i = 0; i < hg.getChildCount(); i++) {
-                    android.view.View c = hg.getChildAt(i);
-                    if (host == null && c instanceof android.view.ViewGroup && c.getClass().getName().indexOf("ViewPager2") < 0) host = (android.view.ViewGroup) c;
-                }
-                vp0 = (host != null) ? (android.view.ViewParent) host : (android.view.ViewParent) hg;
-            }
-            if (!(vp0 instanceof android.view.ViewGroup)) { flog("IDENTIFY", "无可用容器, 跳过"); return; }
-            final android.view.ViewGroup parent = (android.view.ViewGroup) vp0;
-            final android.view.View anchorF = anchor;
-            android.view.View exist = parent.findViewWithTag(IDENTIFY_TAG + "_icon");
-            if (exist != null) return;
-            final android.widget.ImageView iv = new android.widget.ImageView(act);
-            int rid = res.getIdentifier("identify_widget_icn_new", "drawable", pkg);   // v30: 换成更实的识曲图标
-            if (rid == 0) rid = res.getIdentifier("shortcut_identify", "drawable", pkg);
-            if (rid != 0) iv.setImageResource(rid);
-            else iv.setImageResource(android.R.drawable.ic_btn_speak_now);
-            float d = res.getDisplayMetrics().density;
-            int w = (anchorF != null && anchorF.getWidth() > 0) ? anchorF.getWidth() : (int) (33 * d);
-            int h = (anchorF != null && anchorF.getHeight() > 0) ? anchorF.getHeight() : w;
-            int pad = (int) (6 * d);
-            iv.setPadding(0, 0, 0, 0);
-            iv.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
-            iv.setTag(IDENTIFY_TAG + "_icon");
-            iv.setContentDescription("听歌识曲");
-            iv.setClickable(true);
-            // v47: 外观改成"红色圆底 + 白色识曲图标"(与 APP 的 postBtn 同款)
-            try {
-                android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
-                g.setShape(android.graphics.drawable.GradientDrawable.OVAL);
-                g.setColor(0xFFEC4141);
-                iv.setBackground(g);
-                iv.setColorFilter(0xFFFFFFFF);
-                int p2 = Math.max(6, (int) (w * 0.22f));
-                iv.setPadding(p2, p2, p2, p2);
-                flog("IDENTIFY", "外观: 红色圆底 + 白色图标 (size=" + w + ")");
-            } catch (Throwable t) {
-                applyTopbarTint(anchorF != null ? anchorF : parent, iv);
-            }
-            iv.setOnClickListener(new android.view.View.OnClickListener() {
-                public void onClick(android.view.View v) { startIdentify(act); }
-            });
-            if (parent instanceof android.widget.FrameLayout) {
-                android.widget.FrameLayout.LayoutParams np = new android.widget.FrameLayout.LayoutParams(w, h);
-                np.gravity = android.view.Gravity.TOP | android.view.Gravity.LEFT;
-                int left = (anchorF != null) ? (anchorF.getLeft() - w - pad) : (int) (200 * d);
-                if (left < 0) left = (int) (12 * d);
-                np.leftMargin = left;
-                np.topMargin = (anchorF != null) ? anchorF.getTop() : (int) (8 * d);
-                iv.setLayoutParams(np);
-                parent.addView(iv);
-                flog("IDENTIFY", "已插入(锚点左侧/同尺寸 " + w + "x" + h + ", left=" + left + ") 容器=" + parent.getClass().getName());
-            } else if (anchorF != null && parent instanceof android.widget.LinearLayout) {
-                int idx = parent.indexOfChild(anchorF);
-                iv.setLayoutParams(new android.widget.LinearLayout.LayoutParams(w, h));
-                parent.addView(iv, Math.max(0, idx));
-                flog("IDENTIFY", "已插入(LinearLayout 锚点左侧 idx=" + idx + ", " + w + "x" + h + ")");
-            } else {
-                iv.setLayoutParams(new android.view.ViewGroup.LayoutParams(w, h));
-                parent.addView(iv);
-                flog("IDENTIFY", "已插入(通用追加, " + w + "x" + h + ") 容器=" + parent.getClass().getName());
-            }
-            if (search != null) {   // 长按搜索 → 识曲(仅锚点存在时)
-                search.setOnLongClickListener(new android.view.View.OnLongClickListener() {
-                    public boolean onLongClick(android.view.View v) { startIdentify(act); return true; }
-                });
-                flog("IDENTIFY", "已挂: 长按搜索图标 → 听歌识曲");
-            }
-        } catch (Throwable t) { flog("IDENTIFY", "装入口失败: " + t); }
     }
 
     // ===== v19: 首页推荐页模块清理 =====
@@ -5013,6 +5198,47 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { flog("INIT", "NeteaseMusicUtils 失败: " + t); }
 
         // ===== 项目1: 去开屏广告 =====
+        // ① 渠道闸门伪装(v8.4): jk.a.V() = b2.g("google") = 官方"GP渠道无广告"总闸(9.5.70=km.a)。
+        //    强制 true 后 App 走 nogetad/needFilterAd 分支, 开屏广告请求根本不发, 预取同样被掐,
+        //    冷启广告等待 2000ms→300ms。全 App 6 处调用点均在广告链路, 无其它副作用。
+        //    定位链: 硬编码 jk.a(形状校验) → DexKit 按类体特征串 "Session.Account" 反查会话管理器类。
+        //    注: VIP 客户端标志 E()=isBlackVip 只控黑胶启动图不控广告; 服务端按真实账号 vipType
+        //    决定下发(SVIP 照样下发, 实证), 伪装 VIP 无效 —— 渠道闸门才是客户端唯一总闸。
+        try {
+            Class<?> gateCls = null;
+            try {
+                Class<?> c1 = XposedHelpers.findClass("jk.a", cl);
+                if (adGateShape(c1)) gateCls = c1;
+            } catch (Throwable t1) { }
+            if (gateCls == null) {
+                try {
+                    for (String h : dexkitFindMethodsByString(cl, "Session.Account")) {
+                        int ph = h.indexOf('#');
+                        if (ph <= 0) continue;
+                        try {
+                            Class<?> c2 = XposedHelpers.findClass(h.substring(0, ph), cl);
+                            if (adGateShape(c2)) { gateCls = c2; break; }
+                        } catch (Throwable t3) { }
+                    }
+                } catch (Throwable t2) { }
+            }
+            if (gateCls != null) {
+                final Class<?> gateClsF = gateCls;
+                XposedBridge.hookAllMethods(gateCls, "V", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        if (param.args != null && param.args.length > 0) return;   // 只动无参 boolean V()
+                        if (!prefAdBlock) return;
+                        flog("ADBLOCK", "渠道无广告闸门 " + gateClsF.getName() + ".V() -> true (App跳过广告请求)");
+                        param.result = Boolean.TRUE;
+                    }
+                });
+                flog("INIT", "hooked " + gateCls.getName() + ".V (渠道无广告闸门伪装)");
+            } else {
+                flog("INIT", "渠道无广告闸门未定位(jk.a 失配且 DexKit 未命中), 网络层仍兜底");
+            }
+        } catch (Throwable t) { flog("INIT", "渠道闸门伪装失败: " + t); }
+
         try {
             Class<?> lam = XposedHelpers.findClass("com.netease.cloudmusic.module.ad.LoadingAdManager", cl);
             Class<?> adInfoCls = XposedHelpers.findClass("com.netease.cloudmusic.module.ad.meta.AdInfo", cl);
@@ -5049,6 +5275,7 @@ public class MainHook implements IXposedHookLoadPackage {
             });
             flog("INIT", "hooked LoadingAdActivity.onCreate (兜底秒退)");
         } catch (Throwable t) { flog("INIT", "LoadingAdActivity 失败: " + t); }
+        flog("INIT", "开屏广告三层拦截=①渠道闸门V()伪装(不请求) ②网络层(ad/loading/* → ads:[]) ③E()/LoadingAdActivity兜底");
 
         // ===== 方向2-4: URS dat 私钥库 =====
         try {
@@ -5124,6 +5351,26 @@ public class MainHook implements IXposedHookLoadPackage {
                                     flog("PODCAST_CLEAN", "未找到 data 数组(响应结构变化?)");
                                 }
                             } catch (Throwable t4) { flog("PODCAST_CLEAN", "<err " + t4 + ">"); }
+                        }
+                        // v8.2: 开屏广告网络层拦截 — 9.5.96 开屏广告走 /eapi|xeapi/ad/loading/get(展示)
+                        // 与 /ad/loading/bidget(预取) 两个端点, 且素材预取完成时 LoadingAdManager.E
+                        // 根本不被调用(老 hook 零命中)。把顶层 ads[] 清成 [] = 服务端自己的"无广告"
+                        // 合法形态, App 直接跳主页面。前缀匹配 ad/loading/ 同时覆盖两个端点。
+                        if (prefAdBlock && url2 != null && url2.indexOf("ad/loading/") >= 0) {
+                            try {
+                                if (text != null && text.length() > 0) {
+                                    String out3 = emptyJsonArrayForKey(text, "ads");
+                                    if (out3 != null && out3.length() != text.length()) {
+                                        flog("ADBLOCK", "开屏广告响应已清空: " + text.length() + " → " + out3.length() + " 字节");
+                                        Object nr3 = rebuildResponse(resp, out3, cl);
+                                        if (nr3 != null) setParamResult(param, nr3);
+                                    } else if (out3 != null) {
+                                        flog("ADBLOCK", "loading-ad ads 已为空(服务端未下发, len=" + text.length() + ")");
+                                    } else {
+                                        flog("ADBLOCK", "loading-ad 响应无 ads 数组(len=" + text.length() + ", 结构变化?)");
+                                    }
+                                }
+                            } catch (Throwable t5) { flog("ADBLOCK", "<bidget err " + t5 + ">"); }
                         }
                     } catch (Throwable t) { flog("HTTP_RESP", "<err " + t + ">"); }
                 }
@@ -5249,6 +5496,66 @@ public class MainHook implements IXposedHookLoadPackage {
 
         // ===== 乐迷团(事件驱动) =====
         installFansHideEventHook(cl);
+
+        // ===== 抽屉VIP挽回卡(侦察探针, v8.6) =====
+        try {
+            Class<?> tvCls = XposedHelpers.findClass("android.widget.TextView", cl);
+            XposedBridge.hookAllMethods(tvCls, "setText", new XC_MethodHook() {
+                private long lastLog = 0;
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    try {
+                        if (param.args == null || param.args.length == 0) return;
+                        Object a0 = param.args[0];
+                        String t = a0 instanceof CharSequence ? a0.toString() : null;
+                        if (t == null || t.length() == 0 || t.length() > 40) return;
+                        boolean hit = t.contains("期待您的回归") || t.contains("特权已失效") || t.contains("续费立享")
+                                || t.contains("会员特权") || t.contains("每日打卡") || t.contains("学生特惠")
+                                || t.contains("优惠开通") || t.contains("立享优惠");
+                        if (!hit) return;
+                        long now = System.currentTimeMillis();
+                        if (now - lastLog < 2000) return;
+                        lastLog = now;
+                        StringBuilder sb = new StringBuilder("命中[" + t + "] 链:");
+                        android.view.View v = (android.view.View) param.thisObject;
+                        for (int i = 0; i < 10 && v != null; i++) {
+                            sb.append(" <").append(v.getClass().getSimpleName())
+                              .append(' ').append(v.getWidth()).append('x').append(v.getHeight());
+                            Object tag = v.getTag();
+                            if (tag != null) sb.append(" tag=").append(tag);
+                            sb.append('>');
+                            android.view.ViewParent vp = v.getParent();
+                            v = vp instanceof android.view.View ? (android.view.View) vp : null;
+                        }
+                        flog("CARDCUSTOM", sb.toString());
+                    } catch (Throwable t) { }
+                }
+            });
+            flog("INIT", "hooked TextView.setText (抽屉VIP卡侦察探针)");
+        } catch (Throwable t) { flog("INIT", "抽屉VIP卡探针失败: " + t); }
+
+        // ===== 抽屉VIP卡: 相册选图结果回传(v8.7) =====
+        // 子类普遍覆盖 onActivityResult 不调 super, hook 基类收不到; dispatchActivityResult 是
+        // onActivityResult 的唯一上游分发点(基类实现, 子类不覆盖), 在这里一定能看到所有回传
+        try {
+            XposedBridge.hookAllMethods(android.app.Activity.class, "dispatchActivityResult", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    try {
+                        if (param.args == null || param.args.length < 4) return;
+                        Object req = param.args[1], res = param.args[2], data = param.args[3];
+                        if (!(req instanceof Integer) || ((Integer) req) != CARD_PICK_REQ) return;
+                        if (!(res instanceof Integer) || ((Integer) res) != -1) return;   // RESULT_OK
+                        if (!(data instanceof android.content.Intent)) return;
+                        final android.net.Uri uri = ((android.content.Intent) data).getData();
+                        if (uri == null) return;
+                        if (!(param.thisObject instanceof android.app.Activity)) return;
+                        cardSaveFromUri((android.app.Activity) param.thisObject, uri);
+                    } catch (Throwable t) { }
+                }
+            });
+            flog("INIT", "hooked dispatchActivityResult (卡片选图回传)");
+        } catch (Throwable t) { flog("INIT", "选图回传hook失败: " + t); }
 
         // ===== v57: 探针3 —— SQLite 层(不依赖类名) =====
         try {
