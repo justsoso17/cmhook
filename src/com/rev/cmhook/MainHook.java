@@ -24,7 +24,7 @@ public class MainHook implements IXposedHookLoadPackage {
  *
  * 分区目录 (按方法名前缀可检索):
  *   [配置]   loadPrefs/savePref/setHudEnabled          — cmhook_prefs 读写, Application.attach 早载
- *   [日志]   flog/LSP_TAGS/trunc/rotateLogIfHuge       — 双通道: cm_hook.log(全量) + LSPosed(白名单镜像)
+ *   [日志]   flog/LSP_TAGS/trunc/rotateLogIfHuge       — 双通道: cm_hook.log(宿主私有, 全量) + LSPosed(仅INIT/SET镜像)
  *   [HUD]    hud/pushHud/renderHud/createHud/attachEntryChip/translatePath — 独白悬浮窗+设置入口芯片
  *   [面板]   showSettingsDialog/showProbeDialog/showTabsKeepDialog/mi* — Miuix 风格纯 View 弹窗
  *   [频道]   applyTopTabs/applyTabsCentering/filterHiddenTabs/reapplyLiveFilter/
@@ -87,16 +87,18 @@ public class MainHook implements IXposedHookLoadPackage {
     // 命中 URL: interface3.music.163.com/eapi/link/page/rcmd/resource/show
     // 机制: 响应体 data.blocks[] 按顺序渲染; 命中锚点块后, 该块及其后所有块整段切除
     private static final String HOME_FEED_URL_KEY = "link/page/rcmd/resource/show";
-    // 锚点规则(逗号分隔), 两种写法混合可用:
-    //   CODE:PAGE_RECOMMEND_XXX  -> 块 positionCode 精确匹配
-    //   TEXT:最近常听            -> 块 JSON 内出现该文本即视为锚点(不依赖 code 名)
-    private static volatile String prefHomeCleanAnchor = "";
-    private static final String HOME_CLEAN_ANCHOR_DEFAULT = "CODE:PAGE_RECOMMEND_SHORTCUT,TEXT:home_recent_play_module";
-    // v7.8: 锚点块消失后的兜底 —— 首页只保留这些 positionCode 的块(其余整段删除)
-    private static final String HOME_CLEAN_KEEP_DEFAULT =
-            "PAGE_RECOMMEND_DAILY_RECOMMEND,PAGE_RECOMMEND_PRIVATE_RCMD_SONG,PAGE_RECOMMEND_RED_SIMILAR_SONG";
-    private static volatile String prefHomeCleanKeep = HOME_CLEAN_KEEP_DEFAULT;
-    private static volatile boolean homeCleanArmed = false;   // 首屏命中锚点后, 后续分页批次整批清空
+    // v1.0.13: 精细控制隐藏集(屏蔽制, 勾选=隐藏); 默认=迁移自旧白名单(保留3块 → 隐藏其余)
+    private static final String HOME_HIDE_BLOCKS_DEFAULT =
+            "PAGE_RECOMMEND_SPECIAL_CLOUD_VILLAGE_PLAYLIST,PAGE_RECOMMEND_BANNER_1,PAGE_RECOMMEND_HOT_RESOURCE,PAGE_RECOMMEND_RANK,PAGE_RECOMMEND_SHORTCUT";
+    private static volatile String prefHomeHideBlocks = HOME_HIDE_BLOCKS_DEFAULT;
+    private static volatile String prefHomeHideCards = "";       // 条目: resourceType|subTitle
+    private static volatile boolean prefHomeHideTopRow = false;  // 顶部卡片行整行隐藏
+    private static volatile String prefHomeSeenBlocks = "";      // 发现累积(逗号分隔)
+    private static volatile String prefHomeSeenCards = "";       // 最近一次响应的卡清单(替换语义; 条目 type|sub|sample 分隔)
+    private static final java.util.LinkedHashMap<String,String> sBlockTitles = new java.util.LinkedHashMap<String,String>(); // code → 最近一次响应里的块标题(标题来源见 blockTitleOf)
+    private static final java.util.HashMap<String,Integer> sBlockTitlePrio = new java.util.HashMap<String,Integer>();        // code → 标题来源优先级(2头部/1资源头/0首个)
+    private static volatile long homeLastSeen = 0L;
+    private static volatile int homeStructFail = 0;              // 结构校验连续失败计数(哨兵)
     // v20: 我的页 → 播客 → 「为你推荐」(blockCode=MY_PAGE_PODCAST_RECOMMEND)
     private static final String PODCAST_REC_URL_KEY = "my/podcast/tab/recommend";
     private static volatile int feedDumpCount = 0;
@@ -166,15 +168,42 @@ public class MainHook implements IXposedHookLoadPackage {
             prefCardCustom = sp.getBoolean("card_custom", true);
             prefIdentifyLongPress = sp.getBoolean("identify_longpress", true);
             prefUiCollapsed = sp.getString("ui_collapsed", "g3");
-            prefHomeCleanAnchor = sp.getString("home_clean_anchor", HOME_CLEAN_ANCHOR_DEFAULT);
-            prefHomeCleanKeep = sp.getString("home_clean_keep", HOME_CLEAN_KEEP_DEFAULT);
+            prefHomeHideBlocks = homeHideNormalize(sp.getString("home_hide_blocks", HOME_HIDE_BLOCKS_DEFAULT));
+            prefHomeHideCards = homeHideNormalize(sp.getString("home_hide_cards", ""));
+            prefHomeHideTopRow = sp.getBoolean("home_hide_toprow", false);
+            prefHomeSeenBlocks = sp.getString("home_seen_blocks", "");
+            prefHomeSeenCards = sp.getString("home_seen_cards", "");
+            synchronized (sBlockTitles) {
+                sBlockTitles.clear();
+                sBlockTitlePrio.clear();
+                for (String e : splitEntries(sp.getString("cmhook_block_titles", ""))) {
+                    int p1 = e.indexOf('|');
+                    if (p1 > 3) {
+                        int p2 = e.indexOf('|', p1 + 1);
+                        if (p2 > p1) {
+                            try {
+                                String code = e.substring(0, p1);
+                                int pr = Integer.parseInt(e.substring(p1 + 1, p2));
+                                String t = e.substring(p2 + 1);
+                                if (!isGarbageTitle(t)) {   // v121 残留坏值(首字符×N): 不显示, 等真实标题覆盖
+                                    sBlockTitles.put(code, t);
+                                    sBlockTitlePrio.put(code, pr);
+                                }
+                            } catch (Throwable t2) { }
+                        }
+                    }
+                }
+            }
+            homeLastSeen = sp.getLong("home_last_seen", 0L);
+            flog("HOME_CLEAN", "载入隐藏集: [" + prefHomeHideBlocks + "] 卡:[" + prefHomeHideCards
+                 + "] top=" + prefHomeHideTopRow + " (归一化后)");
             rvCapRight = sp.getInt("rv_cap_right", -1);
             rvCapBottom = sp.getInt("rv_cap_bottom", -1);
             prefTabsKeep = sp.getString("top_tabs_keep", "");
             prefsLoaded = true;
             flog("SET", "配置载入 hud=" + prefHud + " hudTranslate=" + prefHudTranslate + " adblock=" + prefAdBlock + " antirevoke=" + prefAntiRevoke
                 + " homeClean=" + prefHomeClean + " podcastClean=" + prefPodcastClean + " protoCollect=" + prefProtoCollect
-                + " anchor=[" + prefHomeCleanAnchor + "]");
+                + "");
             // v19: 丢掉旧的本地 feed 缓存(否则秒开渲染会用未过滤副本)
             // v7.6/v7.7: 开关打开 = ① 切换那一刻立刻清 ② 之后每次冷启动都做一次"智能清"
             //   智能 = 只删含未过滤锚点(PAGE_RECOMMEND_SHORTCUT / home_recent_play_module / 最近常听)的缓存,
@@ -1010,7 +1039,7 @@ public class MainHook implements IXposedHookLoadPackage {
                             if (seenAdapters.contains(cn)) return;
                             seenAdapters.add(cn);
                         }
-                        flog("INIT", "setAdapter探针: " + cn
+                        flog("TRACE", "setAdapter探针: " + cn
                             + " @loader" + Integer.toHexString(System.identityHashCode(ad.getClass().getClassLoader())));
                         // v11: 顶栏适配器可能先于数据咽喉被挂上pager — 探针侧一并记住,
                         // 热切换重过滤不再单纯依赖咽喉hook曾触发过
@@ -1452,6 +1481,259 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { flog("SET", "频道勾选失败: " + t); }
     }
 
+    // 精细页"重启网易云": 闹钟在进程死后拉起启动页 → 真·冷启动
+    // (直接 startActivity 再自杀会把新任务一起带走; PendingIntent+Alarm 跨进程死亡存活)
+    private static void restartHostApp(android.content.Context c) {
+        try {
+            android.content.Intent li = c.getPackageManager().getLaunchIntentForPackage(c.getPackageName());
+            if (li != null) {
+                li.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                // FLAG_IMMUTABLE=0x04000000 (API23+): 编译用 android.jar 是裁剪版没有该常量;
+                // 宿主 targetSdk 33, Android 12+ 不显式指定 mutability 会 IllegalArgumentException
+                android.app.PendingIntent pi = android.app.PendingIntent.getActivity(c, 0, li,
+                        android.app.PendingIntent.FLAG_UPDATE_CURRENT | 0x04000000);
+                android.app.AlarmManager am = (android.app.AlarmManager) c.getSystemService(android.content.Context.ALARM_SERVICE);
+                if (am != null) am.set(android.app.AlarmManager.RTC, System.currentTimeMillis() + 800, pi);
+            }
+        } catch (Throwable t) {
+            try {
+                android.content.Intent li2 = c.getPackageManager().getLaunchIntentForPackage(c.getPackageName());
+                if (li2 != null) { li2.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK); c.startActivity(li2); }
+            } catch (Throwable t2) { }
+        }
+        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() { public void run() {
+            try { android.os.Process.killProcess(android.os.Process.myPid()); } catch (Throwable t) { }
+            try { System.exit(0); } catch (Throwable t) { }
+        } }, 400);
+    }
+
+    // ===== 首页推荐精细控制对话框 (v1.0.14) =====
+    // 屏蔽制(勾选=隐藏); 数据=发现式累积(实时响应+落盘); 双层: 顶部卡片级 + 内容块级。
+    // 保底联动: 卡片全隐藏→整行自动移除(卡组开关全部关闭时提示)。
+    // v1.0.14: 隐藏集指纹变更→防抖强刷首页缓存(勾选从关到开即时生效, 不再等旧 MMKV 副本);
+    //          互斥置灰: 总开关关→全部子项灰, 整行隐藏开→单卡勾选灰。
+    private static void showHomeFineDialog(final android.app.Activity act) {
+        try {
+            float d = miDens(act);
+            android.widget.LinearLayout panel = new android.widget.LinearLayout(act);
+            panel.setOrientation(android.widget.LinearLayout.VERTICAL);
+            panel.setBackground(miBg(TK_SURFACE, 24 * d));
+            panel.setPadding((int) (16 * d), (int) (14 * d), (int) (16 * d), (int) (16 * d));
+            panel.addView(miText(act, "首页推荐精细控制", 20, 0xFFFFFFFF, true));
+            String sub;
+            if (homeLastSeen > 0) {
+                String t = new java.text.SimpleDateFormat("HH:mm").format(new java.util.Date(homeLastSeen));
+                sub = "上次发现 " + t + " · " + splitEntries(prefHomeSeenCards).length + " 卡片 · "
+                      + homeSeenBlockSet().size() + " 区块 · 勾选=隐藏";
+            } else {
+                sub = "还没有发现数据: 打开一次首页「推荐」后自动发现";
+            }
+            panel.addView(miText(act, sub, 12, TK_TEXT_SUB, false));
+            android.widget.TextView hintT = miText(act, "重启网易云生效，最下方提供了重启按钮", 11, TK_TEXT_HINT, false);
+            hintT.setPadding(0, (int) (2 * d), 0, 0);
+            panel.addView(hintT);
+            panel.addView(miText(act, " ", 4, TK_TEXT_SUB, false));
+
+            // ---- 互斥置灰基建(先声明, 监听器里引用) ----
+            final java.util.List<android.view.View> cardRowsL = new java.util.ArrayList<android.view.View>();
+            final java.util.List<android.widget.Switch> cardSwsL = new java.util.ArrayList<android.widget.Switch>();
+            final java.util.List<android.view.View> blkRowsL = new java.util.ArrayList<android.view.View>();
+            final java.util.List<android.widget.Switch> blkSwsL = new java.util.ArrayList<android.widget.Switch>();
+            final android.view.View[] topRowV = new android.view.View[1];
+            final android.widget.Switch[] topRowSw = new android.widget.Switch[1];
+            final Runnable applyFineEn = new Runnable() { public void run() {
+                boolean m = prefHomeClean;
+                boolean cardEn = m && !prefHomeHideTopRow;   // 整行隐藏优先于单卡勾选
+                miSetEnabled(topRowV[0], topRowSw[0], m);
+                for (int i = 0; i < cardRowsL.size(); i++) miSetEnabled(cardRowsL.get(i), cardSwsL.get(i), cardEn);
+                for (int i = 0; i < blkRowsL.size(); i++) miSetEnabled(blkRowsL.get(i), blkSwsL.get(i), m);
+            } };
+
+            // ---- 总开关状态(开关本体在主面板「首页内容清理」, 同一个开关不放两份) ----
+            android.widget.LinearLayout masterCard = miCard(act, d);
+            android.widget.TextView mst = miText(act, prefHomeClean
+                    ? "总开关: 已开启 · 切换在主面板「首页内容清理」"
+                    : "总开关: 已关闭 — 下方设置暂不生效, 请到主面板打开",
+                    13, prefHomeClean ? TK_TEXT_SUB : 0xFFEC4141, false);
+            mst.setPadding((int) (14 * d), (int) (10 * d), (int) (10 * d), (int) (10 * d));
+            masterCard.addView(mst);
+            android.widget.LinearLayout.LayoutParams mcL = new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            mcL.setMargins(0, (int) (4 * d), 0, (int) (10 * d));
+            panel.addView(masterCard, mcL);
+
+            // ---- 顶部卡片行 ----
+            android.widget.LinearLayout cardBox = miCard(act, d);
+            android.widget.Switch swTop = miSwitch(act, prefHomeHideTopRow);
+            android.widget.LinearLayout topRow = miRow(act, "整行隐藏(顶部卡片行)", "整块移除, 优先于单卡 · 页头: 重启网易云生效", swTop);
+            topRowV[0] = topRow; topRowSw[0] = swTop;
+            swTop.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                    prefHomeHideTopRow = checked; savePref(act, "home_hide_toprow", checked);
+                    onHomePrefsChanged(act);
+                    applyFineEn.run();
+                    flog("SET", "顶部卡片行整行隐藏 -> " + checked + (checked ? " (单卡勾选已灰化)" : ""));
+                }
+            });
+            cardBox.addView(topRow);
+            java.util.LinkedHashSet<String> cardUnion = new java.util.LinkedHashSet<String>();
+            for (String e : splitEntries(prefHomeSeenCards)) cardUnion.add(e);
+            for (String k : strSet(prefHomeHideCards)) cardUnion.add(k);
+            String[] cardEntries = cardUnion.toArray(new String[0]);
+            if (cardEntries.length == 0) {
+                android.widget.TextView tv = miText(act, "暂无卡片数据: 打开一次首页「推荐」后自动发现", 12, TK_TEXT_HINT, false);
+                tv.setPadding((int) (14 * d), (int) (10 * d), 0, (int) (10 * d));
+                cardBox.addView(tv);
+            }
+            for (final String entry : cardEntries) {
+                int p1 = entry.indexOf('|');
+                if (p1 < 0) continue;
+                final String type = entry.substring(0, p1);
+                String rest = entry.substring(p1 + 1);
+                final String subName;
+                String sample = "";
+                int p2 = rest.indexOf('|');
+                if (p2 >= 0) { subName = rest.substring(0, p2); sample = rest.substring(p2 + 1); }
+                else { subName = rest; }
+                final String key = type + "|" + subName;
+                boolean hidden = strSet(prefHomeHideCards).contains(key);
+                android.widget.Switch sw = miSwitch(act, hidden);
+                String name = homeCardName(type, subName);
+                android.widget.LinearLayout row = miRow(act, name,
+                        type + (sample.length() > 0 ? " · " + sample : ""), sw);
+                sw.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                    public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                        java.util.HashSet<String> set = strSet(prefHomeHideCards);
+                        if (checked) set.add(key); else set.remove(key);
+                        prefHomeHideCards = joinComma(set);
+                        savePrefStr(act, "home_hide_cards", prefHomeHideCards);
+                        onHomePrefsChanged(act);
+                        flog("SET", "卡片[" + name + "] -> " + (checked ? "隐藏" : "显示") + " (已联动刷缓存)");
+                    }
+                });
+                cardBox.addView(row);
+                cardRowsL.add(row); cardSwsL.add(sw);
+            }
+            android.widget.LinearLayout.LayoutParams cardL = new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            cardL.setMargins(0, (int) (4 * d), 0, (int) (10 * d));
+            panel.addView(cardBox, cardL);
+
+            // ---- 内容区块 ----
+            android.widget.LinearLayout blkBox = miCard(act, d);
+            java.util.LinkedHashSet<String> blockUnion = homeSeenBlockSet();
+            blockUnion.addAll(strSet(prefHomeHideBlocks));
+            String[] blockCodes = blockUnion.toArray(new String[0]);
+            java.util.Arrays.sort(blockCodes);
+            if (blockCodes.length == 0) {
+                android.widget.TextView tv = miText(act, "暂无区块数据: 打开一次首页「推荐」后自动发现", 12, TK_TEXT_HINT, false);
+                tv.setPadding((int) (14 * d), (int) (10 * d), 0, (int) (10 * d));
+                blkBox.addView(tv);
+            }
+            for (final String code : blockCodes) {
+                if (code.equals(DAILY_CODE)) continue;   // 顶部行在上面单独管理
+                boolean hidden = strSet(prefHomeHideBlocks).contains(code);
+                // 显示名: 抓到的页面文案 → 字典名 → 代码名
+                // (有真文案的块永远优先真文案; 协议里没有任何文案的块如运营Banner才用字典名兜底)
+                String nm;
+                synchronized (sBlockTitles) { nm = sBlockTitles.get(code); }
+                if (nm == null || nm.length() == 0) nm = homeBlockLabel(code);
+                if (nm == null || nm.length() == 0) nm = code;
+                android.widget.Switch sw = miSwitch(act, hidden);
+                android.widget.LinearLayout row = miRow(act, nm, code, sw);
+                sw.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                    public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                        java.util.HashSet<String> set = strSet(prefHomeHideBlocks);
+                        if (checked) set.add(code); else set.remove(code);
+                        prefHomeHideBlocks = joinComma(set);
+                        savePrefStr(act, "home_hide_blocks", prefHomeHideBlocks);
+                        onHomePrefsChanged(act);
+                        flog("SET", "区块[" + homeBlockLabel(code) + "] -> " + (checked ? "隐藏" : "显示") + " (已联动刷缓存)");
+                    }
+                });
+                blkBox.addView(row);
+                blkRowsL.add(row); blkSwsL.add(sw);
+            }
+            android.widget.LinearLayout.LayoutParams blkL = new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            blkL.setMargins(0, 0, 0, (int) (10 * d));
+            panel.addView(blkBox, blkL);
+
+            // ---- 按钮: 重启网易云(页头改动冷启动生效) / 重新发现 / 恢复默认 ----
+            final android.app.Dialog[] dlgH = new android.app.Dialog[1];
+            android.widget.TextView bReboot = miPill(act, "重启网易云生效(冷启动)", TK_PRIMARY, true);
+            bReboot.setPadding((int) (10 * d), (int) (12 * d), (int) (10 * d), (int) (12 * d));
+            bReboot.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    toast(act, "正在重启网易云…");
+                    flog("SET", "用户触发重启网易云(冷启动生效页头改动)");
+                    restartHostApp(act);
+                }
+            });
+            android.widget.LinearLayout.LayoutParams rbLp = new android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            rbLp.setMargins(0, (int) (10 * d), 0, 0);
+            panel.addView(bReboot, rbLp);
+
+            android.widget.LinearLayout btns = new android.widget.LinearLayout(act);
+            btns.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            android.widget.TextView bRe = miPill(act, "从最近响应重新发现", TK_PRIMARY, true);
+            bRe.setPadding((int) (10 * d), (int) (10 * d), (int) (10 * d), (int) (10 * d));
+            bRe.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    new Thread(new Runnable() { public void run() {
+                        try {
+                            // 替换语义: 区块/卡清单 = 最近若干份落盘响应(页配置+feed)的并集
+                            boolean any = false, resetPending = true;
+                            for (int k = 0; k < FEED_DUMP_MAX; k++) {
+                                java.io.File f = new java.io.File("/data/data/" + TARGET_PKG + "/files/cm_feed_raw_" + k + ".json");
+                                if (!f.exists()) continue;
+                                String s = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(f.getAbsolutePath())), "UTF-8");
+                                int nl = s.indexOf('\n');
+                                if (nl > 0) s = s.substring(nl + 1);   // 首行是 URL
+                                if (s.length() < 100) continue;
+                                if (homeDiscover(s, resetPending)) { resetPending = false; any = true; }
+                            }
+                            if (!any) { toast(act, "还没有落盘数据, 先打开一次首页推荐"); return; }
+                            toast(act, "重新发现完成, 重开本页查看");
+                        } catch (Throwable t) { toast(act, "重新发现失败: " + t); }
+                    } }, "cmhook-card-rediscover").start();
+                }
+            });
+            android.widget.TextView bDef = miPill(act, "恢复默认", 0xFF444448, false);
+            bDef.setPadding((int) (10 * d), (int) (10 * d), (int) (10 * d), (int) (10 * d));
+            bDef.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    prefHomeHideBlocks = "";   // 恢复默认 = 全部不隐藏(所有开关全闭, 操作者要求)
+                    prefHomeHideCards = "";
+                    prefHomeHideTopRow = false;
+                    savePrefStr(act, "home_hide_blocks", prefHomeHideBlocks);
+                    savePrefStr(act, "home_hide_cards", prefHomeHideCards);
+                    savePref(act, "home_hide_toprow", false);
+                    onHomePrefsChanged(act);
+                    flog("SET", "首页精细控制恢复默认");
+                    toast(act, "已恢复默认勾选");
+                    dlgH[0].dismiss();
+                    showHomeFineDialog(act);
+                }
+            });
+            android.widget.LinearLayout.LayoutParams bl = new android.widget.LinearLayout.LayoutParams(
+                    0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            bl.setMargins((int) (8 * d), (int) (10 * d), (int) (4 * d), 0);
+            btns.addView(bRe, bl);
+            android.widget.LinearLayout.LayoutParams bl2 = new android.widget.LinearLayout.LayoutParams(
+                    0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            bl2.setMargins((int) (4 * d), (int) (10 * d), (int) (8 * d), 0);
+            btns.addView(bDef, bl2);
+            panel.addView(btns);
+
+            applyFineEn.run();   // 按进入时的开关状态先置灰一轮(总开关关/整行开)
+            dlgH[0] = miDialog(act, panel);
+            dlgH[0].show();
+        } catch (Throwable t) { flog("HOME_CLEAN", "精细控制对话框失败: " + t); }
+    }
+
+
     private static String translatePath(String p) {
         if (p.contains("healthstatus")) return "网络体检";
         if (p.contains("upgrade/get")) return "检查版本更新";
@@ -1515,6 +1797,35 @@ public class MainHook implements IXposedHookLoadPackage {
     private static String hudShort(String s, int n) {
         if (s == null) return "";
         return s.length() > n ? s.substring(0, n) + "…" : s;
+    }
+
+    // HUD 首页清理行: 与精细控制页同语言 —— 原始 positionCode 翻成中文名, 只挑关键信息
+    private static String hudHomeClean(String msg) {
+        String s = msg;
+        if (s.startsWith("精细过滤: ")) {
+            int i = s.indexOf(" / 隐藏 ");
+            String hides = i >= 0 ? s.substring(i + 5).trim() : "无";
+            int p = hides.lastIndexOf(" (");
+            if (p >= 0) hides = hides.substring(0, p);
+            s = "移除 " + hides;
+        }
+        if (s.indexOf("PAGE_RECOMMEND") >= 0) {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("PAGE_RECOMMEND_[A-Z_0-9]+").matcher(s);
+            StringBuilder sb = new StringBuilder();
+            int last = 0;
+            while (m.find()) {
+                sb.append(s, last, m.start()).append(homeBlockLabel(m.group()));
+                last = m.end();
+            }
+            sb.append(s.substring(last));
+            s = sb.toString();
+        }
+        s = s.replace("全部区块已隐藏 → 首页推荐页为空 (hasMore=false)", "全部隐藏 → 页面留空")
+             .replace("发现更新: ", "发现: ").replace(" (home_last_seen 已更新)", "")
+             .replace("隐藏集变更 → 已排程强刷缓存(1.2s 防抖)", "设置变更 → 缓存已刷新")
+             .replace("首页缓存清理: ", "缓存: ")
+             .replace("已触发缓存体检", "缓存体检");
+        return hudShort(s, 70);
     }
 
     private static void pushHud(String text, int color) {
@@ -1645,7 +1956,7 @@ public class MainHook implements IXposedHookLoadPackage {
             } else if (tag.equals("HOME_CLEAN")) {
                 color = HUD_C_BLOCK;
                 if (prefHudTranslate) {
-                    line = msg.indexOf("未命中") >= 0 ? "[首页清理] 无匹配模块(未动)" : "[首页清理] 已移除「最近常听」及以下模块";
+                    line = "[首页清理] " + hudHomeClean(msg);
                 } else {
                     line = "[HOME_CLEAN] " + hudShort(msg, 60);
                 }
@@ -2091,7 +2402,11 @@ public class MainHook implements IXposedHookLoadPackage {
             // ---------- 组 1: 界面与清理 ----------
             java.util.List<android.view.View> g1 = new java.util.ArrayList<android.view.View>();
             android.widget.Switch swHome = miSwitch(act, prefHomeClean);
-            g1.add(miRow(act, "首页内容清理", "移除「最近常听」及以下模块", swHome));
+            android.widget.LinearLayout homeFineRow = miRow(act, "首页内容清理", "总开关 · 点按进入首页推荐精细控制", swHome);
+            homeFineRow.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) { showHomeFineDialog(act); }
+            });
+            g1.add(homeFineRow);
             android.widget.Switch swPod = miSwitch(act, prefPodcastClean);
             g1.add(miRow(act, "播客为你推荐清理", "我的 → 播客 → 移除「为你推荐」", swPod));
             android.widget.Switch swFans = miSwitch(act, prefFansHide);
@@ -2187,7 +2502,9 @@ public class MainHook implements IXposedHookLoadPackage {
             android.widget.Switch swHud = miSwitch(act, prefHud);
             g3.add(miRow(act, "独白 HUD", "屏幕实时透视 · 拖动/折叠", swHud));
             android.widget.Switch swTr = miSwitch(act, prefHudTranslate);
-            g3.add(miRow(act, "HUD 翻译", "关 = 显示原始内容", swTr));
+            final android.widget.LinearLayout trRow = miRow(act, "HUD 翻译", "关 = 显示原始内容", swTr);
+            trRow.setEnabled(prefHud); trRow.setAlpha(prefHud ? 1f : 0.35f); swTr.setEnabled(prefHud);
+            g3.add(trRow);
             android.widget.Switch swProto = miSwitch(act, prefProtoCollect);
             g3.add(miRow(act, "协议采集", "密钥/协议观测(关=省启动开销)", swProto));
             addGroup(act, panel, d, "g3", "调试与采集", true, g3, 2);
@@ -2227,6 +2544,7 @@ public class MainHook implements IXposedHookLoadPackage {
             swHome.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
                 public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
                     prefHomeClean = checked; savePref(act, "home_clean", checked);
+                    homeFpStore(act);   // 同步指纹: 那条路径已有即时智能清理, 不再排程强刷
                     if (checked) {
                         // v7.6: 立刻后台清缓存(只清未过滤那份) —— 否则首页会先渲染 MMKV 里的旧副本
                         savePref(act, "home_clean_purged", true);
@@ -2237,7 +2555,7 @@ public class MainHook implements IXposedHookLoadPackage {
                             th.setDaemon(true);
                             th.start();
                         } catch (Throwable t2) { purgeHomeFeedCache(false); }
-                        toast(act, "首页缓存已清 → 回首页下拉一次即生效");
+                        toast(act, "已开启: 区块下拉生效 · 页头重启网易云生效");
                         flog("SET", "首页内容清理 -> ON (已同步清缓存)");
                     } else {
                         savePref(act, "home_clean_purged", false);   // 复位: 下次再 ON 还会清
@@ -2282,7 +2600,11 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             });
             swHud.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-                public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) { setHudEnabled(act, checked); }
+                public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                    setHudEnabled(act, checked);
+                    // 互斥: HUD 关 → 翻译无作用对象, 置灰
+                    trRow.setEnabled(checked); trRow.setAlpha(checked ? 1f : 0.35f); swTr.setEnabled(checked);
+                }
             });
             swTr.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
                 public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
@@ -2748,12 +3070,11 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // LSPosed 日志白名单: 只镜像功能/生命周期事件。协议采集类高流量标签(HTTP_*/CRONET_*/CMENC_*/SQL_PROBE/
-    // URL_NEW/CIPHER/serialdata 等)只进 cm_hook.log + HUD —— 否则刷爆 LSPosed 日志缓冲区(09-21 用户反馈)。
-    // 新增高流量标签默认不进 LSP, 需要时往这里加。
+    // LSPosed 日志白名单: 只镜像 装载确认(INIT) + 用户操作(SET)。其余(过滤明细/HTTP/CMENC/serialdata/
+    // 探针/页面事件等)只进 cm_hook.log(宿主私有目录) —— LSPosed 缓冲区保持干净(09-21 用户要求"减少到最少")。
+    // 模块崩溃类错误由 LSPosed 自身记录(如 Failed to load class), 不依赖镜像。
     private static final java.util.HashSet<String> LSP_TAGS = new java.util.HashSet<String>(java.util.Arrays.asList(
-            "INIT", "SET", "DEXKIT", "ANTIREVOKE", "IDENTIFY", "TOPTABS",
-            "HOME_CLEAN", "PODCAST_CLEAN", "ADBLOCK", "FANS", "CHIP"));
+            "INIT", "SET"));
 
     private static void flog(String tag, String msg) {
         String line = TS.format(new Date()) + " [" + tag + "] " + msg;
@@ -2765,14 +3086,15 @@ public class MainHook implements IXposedHookLoadPackage {
             try {
                 if (!fileInit) {
                     fileInit = true;
+                    // 首选宿主私有目录(uid 一致, 不暴露在公共存储); sdcard 仅兜底
                     try {
-                        File dir = new File("/sdcard/Android/data/" + TARGET_PKG + "/files");
-                        dir.mkdirs();
+                        File dir = new File("/data/data/" + TARGET_PKG + "/files");
                         currentLogPath = new File(dir, "cm_hook.log").getAbsolutePath();
                         openLogWriter(currentLogPath);
+                        try { new File("/sdcard/Android/data/" + TARGET_PKG + "/files/cm_hook.log").delete(); } catch (Throwable t4) { }
                     } catch (Throwable t2) {
                         try {
-                            File dir2 = new File("/data/data/" + TARGET_PKG + "/cache");
+                            File dir2 = new File("/sdcard/Android/data/" + TARGET_PKG + "/files");
                             dir2.mkdirs();
                             currentLogPath = new File(dir2, "cm_hook.log").getAbsolutePath();
                             openLogWriter(currentLogPath);
@@ -2810,7 +3132,13 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static String trunc(String s) {
         if (s == null) return "<null>";
-        return s.length() > 2600 ? s.substring(0, 2600) + "...<len=" + s.length() + ">" : s;
+        return truncN(s, 2600);
+    }
+
+    // 截断到 n 字符(日志防膨胀: 大 dump 只留头部, 完整内容需要时用专门落盘)
+    private static String truncN(String s, int n) {
+        if (s == null) return "<null>";
+        return s.length() > n ? s.substring(0, n) + "...<len=" + s.length() + ">" : s;
     }
 
     private static String bytesPreview(byte[] b, int max) {
@@ -2855,13 +3183,7 @@ public class MainHook implements IXposedHookLoadPackage {
             for (int k = 0; k < HOME_CACHE_STALE_MARKERS.length; k++) {
                 if (s.indexOf(HOME_CACHE_STALE_MARKERS[k]) >= 0) return true;
             }
-            java.util.HashSet<String> keep = new java.util.HashSet<String>();
-            String[] ks = (prefHomeCleanKeep == null ? "" : prefHomeCleanKeep).split(",");
-            for (int i = 0; i < ks.length; i++) {
-                String k = ks[i].trim();
-                if (k.length() > 0) keep.add(k);
-            }
-            if (keep.isEmpty()) return false;
+            java.util.HashSet<String> hide = strSet(prefHomeHideBlocks);
             int p = 0;
             while ((p = s.indexOf("\"positionCode\"", p)) >= 0) {
                 int q = s.indexOf(':', p + 14);
@@ -2871,8 +3193,15 @@ public class MainHook implements IXposedHookLoadPackage {
                 int e = s.indexOf('"', r + 1);
                 if (e < 0) break;
                 String code = s.substring(r + 1, e);
-                if (!keep.contains(code)) return true;
+                if (hide.contains(code)) return true;   // 缓存里有要隐藏的块 = 脏
                 p = e + 1;
+            }
+            // 隐藏卡的 subTitle 出现在缓存里 = 脏(宽松判定, 宁多清不错留)
+            for (String cardKey : strSet(prefHomeHideCards)) {
+                int p2 = cardKey.indexOf('|');
+                if (p2 < 0) continue;
+                String sub = cardKey.substring(p2 + 1);
+                if (sub.length() > 1 && s.indexOf("\"subTitle\":\"" + sub + "\"") >= 0) return true;
             }
         } catch (Throwable t) {
         } finally {
@@ -2910,6 +3239,52 @@ public class MainHook implements IXposedHookLoadPackage {
             flog("HOME_CLEAN", "首页缓存清理: 删 " + n + " 个(含未过滤锚点)"
                 + (kept > 0 ? " / 保留 " + kept + " 个(已是过滤版)" : "") + (force ? " [强制模式]" : ""));
         } catch (Throwable t) { }
+    }
+
+    // ===== v1.0.14: 开关→缓存联动 =====
+    // 精细控制页所有隐藏项(总开关/整行/卡/块)统一走指纹: 变了才刷, 1.2s 防抖
+    // (连续勾选只刷一次; 必须 force —— "取消勾选"方向的脏缓存(内容缺失)无法用锚点探测)
+    // 注意: Handler 不能做成 static final 字段 —— <clinit> 在主 Looper prepare 之前跑,
+    //       getMainLooper()=null 会 NPE 炸掉整个模块类加载(v1.0.14 首版踩过)
+    private static Runnable sHomePurgePending;
+
+    private static String homePrefsFp() {
+        return prefHomeClean + "|" + prefHomeHideTopRow + "|" + prefHomeHideBlocks + "|" + prefHomeHideCards;
+    }
+
+    // 只同步指纹不排程清理(主面板总开关切换时用: 那条路径已有即时智能清理)
+    private static void homeFpStore(android.content.Context c) {
+        try {
+            c.getSharedPreferences("cmhook_prefs", 0).edit()
+                .putString("home_hide_fp", homePrefsFp()).commit();
+        } catch (Throwable t) { }
+    }
+
+    private static void onHomePrefsChanged(final android.app.Activity act) {
+        try {
+            android.content.SharedPreferences sp = act.getSharedPreferences("cmhook_prefs", 0);
+            String fp = homePrefsFp();
+            if (fp.equals(sp.getString("home_hide_fp", ""))) return;
+            sp.edit().putString("home_hide_fp", fp).commit();
+            android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+            if (sHomePurgePending != null) h.removeCallbacks(sHomePurgePending);
+            sHomePurgePending = new Runnable() { public void run() {
+                new Thread(new Runnable() { public void run() {
+                    try {
+                        purgeHomeFeedCache(true);
+                        // 不弹 toast: 连续勾选会连环弹, 吵。生效规则已在精细页顶部提示行常驻
+                    } catch (Throwable t) { }
+                } }, "cmhook-cache-fine").start();
+            } };
+            h.postDelayed(sHomePurgePending, 1200);
+            flog("HOME_CLEAN", "隐藏集变更 → 已排程强刷缓存(1.2s 防抖)");
+        } catch (Throwable t) { }
+    }
+
+    // 互斥置灰: 行 + 开关一起禁用, alpha 弱化
+    private static void miSetEnabled(android.view.View row, android.widget.Switch sw, boolean en) {
+        if (row != null) { row.setEnabled(en); row.setAlpha(en ? 1f : 0.35f); }
+        if (sw != null) sw.setEnabled(en);
     }
 
     // 任意线程 Toast(切主线程)
@@ -4393,9 +4768,10 @@ public class MainHook implements IXposedHookLoadPackage {
         synchronized (LOG_LOCK) {
             if (feedDumpCount >= FEED_DUMP_MAX) return;
             try {
-                File dir = new File("/sdcard/Android/data/" + TARGET_PKG + "/files");
+                File dir = new File("/data/data/" + TARGET_PKG + "/files");
                 dir.mkdirs();
-                File f = new File(dir, "cm_feed_raw.json");
+                // 轮换槽: 保留最近 FEED_DUMP_MAX 份响应(页配置与 feed 各若干), 供"重新发现"合并扫描
+                File f = new File(dir, "cm_feed_raw_" + (feedDumpCount % FEED_DUMP_MAX) + ".json");
                 java.io.OutputStreamWriter w = new java.io.OutputStreamWriter(new java.io.FileOutputStream(f, false), "UTF-8");
                 w.write(url + "\n");
                 w.write(body);
@@ -4410,7 +4786,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void dumpFeedFiltered(String body, int seq) {
         synchronized (LOG_LOCK) {
             try {
-                File dir = new File("/sdcard/Android/data/" + TARGET_PKG + "/files");
+                File dir = new File("/data/data/" + TARGET_PKG + "/files");
                 dir.mkdirs();
                 File f = new File(dir, "cm_feed_filtered.json");
                 java.io.OutputStreamWriter w = new java.io.OutputStreamWriter(new java.io.FileOutputStream(f, false), "UTF-8");
@@ -4455,18 +4831,152 @@ public class MainHook implements IXposedHookLoadPackage {
         return s.substring(a, b);
     }
 
-    // 字符串级 blocks 切除(不解析/不重排其余字段): 命中锚点块后, 该块及其后所有块整段删除
-    private static String filterHomeFeed(String json) {
-        String anchor = prefHomeCleanAnchor;
-        if (anchor == null || anchor.trim().length() == 0) return null;
+    // ===== v1.0.13: 首页推荐精细控制(发现式双层: 块级 + 顶部卡片级) =====
+    // 结构: data.blocks[] 每块含 positionCode; 顶部块 PAGE_RECOMMEND_DAILY_RECOMMEND 内
+    // dslData.blockResource.resources[] = 顶部可滑动卡片行实例(每卡含 subTitle/resourceType/title)。
+    // 发现式: 每次响应实时提取 positionCode 与卡片清单, 累积持久化(按账号无关的语义身份);
+    // 改写按用户勾选的隐藏集手术。保底: 结构校验门 / 空页放弃 / 卡片全隐藏转整行移除 /
+    // 未知默认显示 / 截断守卫沿用外层 / 总闸 home_clean。
+    private static final String DAILY_CODE = "PAGE_RECOMMEND_DAILY_RECOMMEND";
+
+    private static final java.util.HashMap<String, String> HOME_BLOCK_NAMES = new java.util.HashMap<String, String>();
+    private static final java.util.HashMap<String, String> HOME_CARD_TYPE_NAMES = new java.util.HashMap<String, String>();
+    static {
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_DAILY_RECOMMEND", "顶部卡片行");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_PRIVATE_RCMD_SONG", "猜你喜欢");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_SPECIAL_CLOUD_VILLAGE_PLAYLIST", "歌单推荐横排");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_RANK", "排行榜");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_HOT_RESOURCE", "热门资源位");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_BANNER_0", "运营Banner");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_BANNER_1", "运营Banner");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_SHORTCUT", "快捷入口");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_REAL_TIME_INTEREST_RCMD", "实时兴趣推荐");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_PODCAST_RADIO_PROGRAM", "热门节目推荐");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_PODCAST_NARROW_SCENE", "播客窄场景");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_PODCAST_AUDIO_BOOK", "精品有声书");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_RADAR", "雷达歌单");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_LBS", "同城热门歌曲");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_MUSIC_FM_LIST", "音乐FM列表");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_MY_SHEET", "我的歌单");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_RED_SIMILAR_SONG", "根据歌单推荐");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_RECALL_USERIN_TEREST_SELECT", "召回兴趣精选");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_GREETING", "问候卡");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_NOTE", "笔记");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_VIP_MODULE", "VIP模块");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_VIP_SMALL_CARD", "VIP小卡");
+        HOME_BLOCK_NAMES.put("PAGE_BLOCK_NEW_SONG_AND_ALBUM", "新歌新碟");
+        HOME_BLOCK_NAMES.put("PAGE_BLOCK_STYLE_RCMD", "风格推荐");
+        HOME_BLOCK_NAMES.put("PAGE_BLOCK_TOPLIST", "排行榜块");
+        HOME_BLOCK_NAMES.put("PAGE_BLOCK_SCENE_SONG", "场景歌单");
+        HOME_BLOCK_NAMES.put("PAGE_BLOCK_MLOG", "Mlog");
+        HOME_BLOCK_NAMES.put("PAGE_BLOCK_THEATER", "听书剧场");
+        HOME_BLOCK_NAMES.put("PAGE_BLOCK_TODAY_FORTUNE", "今日运势");
+        HOME_BLOCK_NAMES.put("PAGE_MUSIC_CALENDAR", "音乐日历");
+        HOME_BLOCK_NAMES.put("PAGE_ROAMING", "漫游歌单");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_MIXED_ARTIST_PLAYLIST", "混合艺人歌单");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_NEW_SONG_AND_ALBUM", "新歌新碟");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_FOR_YOU", "为你推荐");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_PODCAST_ALBUM_COVER", "播客专辑封面");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_PODCAST_MUSIC_RADIO", "播客电台");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_PODCAST_RELATE_PROGRAM", "相关节目");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_SEARCH_TOP_BANNER", "搜索页顶部Banner");
+        HOME_BLOCK_NAMES.put("PAGE_RECOMMEND_SECONDARY_TAB", "二级标签页");
+        HOME_CARD_TYPE_NAMES.put("dailySongs", "每日推荐");
+        HOME_CARD_TYPE_NAMES.put("toplist", "榜单");
+        HOME_CARD_TYPE_NAMES.put("star", "心动模式");
+        HOME_CARD_TYPE_NAMES.put("playList", "雷达歌单");
+        HOME_CARD_TYPE_NAMES.put("fm", "漫游");
+        HOME_CARD_TYPE_NAMES.put("similarSong", "相似歌曲");
+        HOME_CARD_TYPE_NAMES.put("similarArtist", "相似艺人");
+        HOME_CARD_TYPE_NAMES.put("podcast", "每日播客");
+        HOME_CARD_TYPE_NAMES.put("album", "新碟");
+    }
+
+    private static String homeBlockLabel(String code) {
+        String n = HOME_BLOCK_NAMES.get(code);
+        return n != null ? n : code;
+    }
+
+    private static String homeCardName(String type, String sub) {
+        if (sub != null && sub.length() > 0) return sub;
+        String n = HOME_CARD_TYPE_NAMES.get(type);
+        return n != null ? n : type;
+    }
+
+    private static java.util.HashSet<String> strSet(String s) {
+        java.util.HashSet<String> out = new java.util.HashSet<String>();
+        if (s != null) for (String k : s.split(",")) { k = k.trim(); if (k.length() > 0) out.add(k); }
+        return out;
+    }
+
+    private static String sanitize(String s) {
+        if (s == null) return "";
+        return s.replace("|", "/").replace("\u0001", " ").replace("\r", " ")
+                .replace("\n", " ").replace(",", "，").trim();
+    }
+
+    // 隐藏集归一化: 兼容误用  连接的历史值, 双分隔符拆分→去重→逗号重连
+    private static String homeHideNormalize(String s) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<String>();
+        if (s != null) for (String k : s.split("[,]")) { k = k.trim(); if (k.length() > 0) out.add(k); }
+        StringBuilder sb = new StringBuilder();
+        boolean first = true;
+        for (String k : out) { if (!first) sb.append(','); sb.append(k); first = false; }
+        return sb.toString();
+    }
+
+    private static String joinComma(java.util.Collection<String> c) {
+        StringBuilder sb = new StringBuilder();
+        for (String s2 : c) { if (sb.length() > 0) sb.append(','); sb.append(s2); }
+        return sb.toString();
+    }
+
+    private static String joinColl(java.util.Collection<String> c) {
+        StringBuilder sb = new StringBuilder();
+        for (String s : c) { if (sb.length() > 0) sb.append('\u0001'); sb.append(s); }
+        return sb.toString();
+    }
+
+    private static String[] splitEntries(String s) {
+        if (s == null || s.length() == 0) return new String[0];
+        return s.split("\u0001");
+    }
+
+    // home_seen_blocks 统一解析: 兼容历史粘连存储(同时按  与逗号拆分), 自动去重
+    private static java.util.LinkedHashSet<String> homeSeenBlockSet() {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<String>();
+        for (String tok : splitEntries(prefHomeSeenBlocks))
+            for (String k : tok.split(","))
+                if (k.trim().length() > 0) out.add(k.trim());
+        return out;
+    }
+
+    private static String jsonField(String obj, String key) {
+        int i = obj.indexOf("\"" + key + "\":");
+        if (i < 0) return null;
+        int q1 = obj.indexOf('"', i + key.length() + 3);
+        if (q1 < 0) return null;
+        int q2 = obj.indexOf('"', q1 + 1);
+        if (q2 < 0) return null;
+        return obj.substring(q1 + 1, q2);
+    }
+
+    // blocks 数组扫描: 字符串感知括号配对, 返回 [lb, rb, 各块区间]/codes; 解析失败返回 null
+    private static class BlocksScan {
+        int lb = -1, rb = -1;
+        java.util.ArrayList<int[]> ranges = new java.util.ArrayList<int[]>();
+        java.util.ArrayList<String> codes = new java.util.ArrayList<String>();
+    }
+
+    private static BlocksScan scanBlocks(String json) {
         int bi = json.indexOf("\"blocks\"");
         if (bi < 0) return null;
         int lb = json.indexOf('[', bi + 8);
         if (lb < 0) return null;
-        java.util.ArrayList<int[]> ranges = new java.util.ArrayList<int[]>();
-        java.util.ArrayList<String> codes = new java.util.ArrayList<String>();
+        BlocksScan sc = new BlocksScan();
+        sc.lb = lb;
         int n = json.length();
-        int depth = 0, start = -1, rbPos = -1;   // rbPos: blocks 数组的 ']'(v7.8 重建用)
+        int depth = 0, start = -1;
         boolean inStr = false, esc = false;
         for (int p = lb + 1; p < n; p++) {
             char c = json.charAt(p);
@@ -4481,100 +4991,335 @@ public class MainHook implements IXposedHookLoadPackage {
             if (c == '}') {
                 depth--;
                 if (depth == 0 && start >= 0) {
-                    ranges.add(new int[]{start, p});
-                    codes.add(blockCode(json, start, p));
+                    sc.ranges.add(new int[]{start, p});
+                    sc.codes.add(blockCode(json, start, p));
                     start = -1;
                 }
                 continue;
             }
-            if (c == ']' && depth == 0) { rbPos = p; break; }
+            if (c == ']' && depth == 0) { sc.rb = p; break; }
         }
-        if (ranges.isEmpty()) return null;
-        boolean firstBatch = json.indexOf("PAGE_RECOMMEND_DAILY_RECOMMEND") >= 0;
-        String[] rules = anchor.split(",");
-        int cutAt = -1;
-        for (int i = 0; i < ranges.size() && cutAt < 0; i++) {
-            String code = codes.get(i);
-            for (int r = 0; r < rules.length; r++) {
-                String ru = rules[r].trim();
-                if (ru.length() == 0) continue;
-                if (ru.startsWith("TEXT:")) {
-                    String txt = ru.substring(5);
-                    int[] rr = ranges.get(i);
-                    if (txt.length() > 0 && json.substring(rr[0], rr[1] + 1).indexOf(txt) >= 0) { cutAt = i; break; }
-                } else {
-                    String want = ru.startsWith("CODE:") ? ru.substring(5) : ru;
-                    if (code != null && code.equals(want)) { cutAt = i; break; }
-                }
+        if (sc.ranges.isEmpty() || sc.rb < 0) return null;
+        return sc;
+    }
+
+    // 块内 resources 数组扫描: 返回 [lb, rb], 元素区间追加进 elems
+    private static int[] scanResources(String blk, java.util.ArrayList<int[]> elems) {
+        int ki = blk.indexOf("\"blockResource\"");
+        if (ki < 0) return null;
+        int ri = blk.indexOf("\"resources\"", ki);
+        if (ri < 0) return null;
+        int lb = blk.indexOf('[', ri + 11);
+        if (lb < 0) return null;
+        int n = blk.length();
+        int depth = 0, start = -1;
+        boolean inStr = false, esc = false;
+        for (int p = lb + 1; p < n; p++) {
+            char c = blk.charAt(p);
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
             }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{') { if (depth == 0) start = p; depth++; continue; }
+            if (c == '}') {
+                depth--;
+                if (depth == 0 && start >= 0) { elems.add(new int[]{start, p}); start = -1; }
+                continue;
+            }
+            if (c == ']' && depth == 0) return new int[]{lb, p};
         }
-        // v7.8: 锚点没命中 → 走"保留白名单"过滤(服务端已不再下发锚点块)
-        if (cutAt < 0) {
-            String keep = prefHomeCleanKeep;
-            if (keep != null && keep.trim().length() > 0 && rbPos > lb) {
-                java.util.HashSet<String> keepSet = new java.util.HashSet<String>();
-                String[] ks = keep.split(",");
-                for (int i = 0; i < ks.length; i++) {
-                    String k = ks[i].trim();
-                    if (k.length() > 0) keepSet.add(k);
+        return null;
+    }
+
+    // 块级显示名: 结构化解析 dslData —— ③ 模块对象 "blockTitle"(头部, 如「鬼卞发行新歌」) ②
+    // 模块直属 "title" / blockResource.title / blockResourceVO.title(如「排行榜」「推荐歌单」「xx的雷达歌单」)。
+    // resources[] 里的 title 是卡片/tab 名(安分守己/摇滚榜), 刻意不取。
+    // org.json 是框架类运行时必有, 但编译用 android.jar 是裁剪版 → 反射调用; 解析失败退化到首个 "title"
+    private static volatile boolean sTitleDbg = false;
+
+    private static String[] blockTitleOf(String blockText) {
+        int p3 = -1, p2 = -1;
+        String t3 = null, t2 = null;
+        try {
+            Object obj = joNew(blockText);
+            Object dsl = joGetObj(obj, "dslData");
+            if (dsl == null) {
+                if (!sTitleDbg) { sTitleDbg = true; flog("HOME_CLEAN", "JSON诊断: 无dslData"); }
+            } else {
+                java.util.ArrayList<Object> mods = new java.util.ArrayList<Object>();
+                java.util.Iterator it = joKeys(dsl);
+                while (it != null && it.hasNext()) {
+                    Object k = it.next();
+                    Object mod = joGetObj(dsl, (String) k);
+                    if (mod != null) mods.add(mod);
                 }
-                StringBuilder sb = new StringBuilder();
-                sb.append(json, 0, lb + 1);
-                java.util.ArrayList<String> kept = new java.util.ArrayList<String>();
-                java.util.ArrayList<String> dropped = new java.util.ArrayList<String>();
-                int cntKeep = 0;
-                for (int i = 0; i < ranges.size(); i++) {
-                    String code = codes.get(i);
-                    if (code != null && keepSet.contains(code)) {
-                        if (cntKeep > 0) sb.append(',');
-                        sb.append(json, ranges.get(i)[0], ranges.get(i)[1] + 1);
-                        cntKeep++;
-                        kept.add(code);
-                    } else {
-                        dropped.add(String.valueOf(code));
+                if (!sTitleDbg) {
+                    sTitleDbg = true;
+                    String sample = mods.isEmpty() ? "无模块"
+                            : joStr(mods.get(0), "blockTitle") + " / " + joStr(mods.get(0), "title");
+                    flog("HOME_CLEAN", "JSON诊断: 模块" + mods.size() + " 首模块blockTitle/title=" + sample);
+                }
+                for (Object mod : mods) {
+                    if (p3 < 0) {
+                        String t = joStr(mod, "blockTitle");
+                        if (t != null && t.trim().length() > 0) { p3 = 3; t3 = cleanTitle(t); }
+                    }
+                    if (p2 < 0) {
+                        String t = joStr(mod, "title");
+                        if (t == null || t.trim().length() == 0) {
+                            Object br = joGetObj(mod, "blockResource");
+                            if (br != null) t = joStr(br, "title");
+                            if (t == null || t.trim().length() == 0) {
+                                Object bv = joGetObj(mod, "blockResourceVO");
+                                if (bv != null) t = joStr(bv, "title");
+                            }
+                        }
+                        if (t != null && t.trim().length() > 0) { p2 = 2; t2 = cleanTitle(t); }
                     }
                 }
-                sb.append(json, rbPos, json.length());
-                String out = sb.toString();
-                if (cntKeep == 0) {
-                    out = out.replace("\"hasMore\":true", "\"hasMore\":false");
-                    homeCleanArmed = false;
+            }
+        } catch (Throwable tt) {
+            if (!sTitleDbg) { sTitleDbg = true; flog("HOME_CLEAN", "JSON诊断异常: " + tt); }
+        }
+        if (p3 >= 0) return new String[]{"3", t3};
+        if (p2 >= 0) return new String[]{"2", t2};
+        // 兜底: 块内首个 "title":" (可能取到卡片/tab名, 优先级最低; JSON 解析无标题时才走到)
+        String t = matchStr(blockText, "\"title\":\"");
+        if (t != null) return new String[]{"0", t};
+        return null;
+    }
+
+    private static String cleanTitle(String t) {
+        t = t.trim();
+        if (t.length() > 40) t = t.substring(0, 40);
+        return t.replace('|', '／');
+    }
+
+    // ===== 反射 org.json =====
+    private static Object joNew(String s) throws Exception {
+        return Class.forName("org.json.JSONObject").getConstructor(String.class).newInstance(s);
+    }
+
+    private static Object joGetObj(Object o, String key) {
+        try {
+            return o.getClass().getMethod("optJSONObject", String.class).invoke(o, key);
+        } catch (Throwable t) { return null; }
+    }
+
+    private static java.util.Iterator<?> joKeys(Object o) {
+        try {
+            return (java.util.Iterator<?>) o.getClass().getMethod("keys").invoke(o);
+        } catch (Throwable t) { return null; }
+    }
+
+    private static String joStr(Object o, String key) {
+        try {
+            return (String) o.getClass().getMethod("optString", String.class).invoke(o, key);
+        } catch (Throwable t) { return null; }
+    }
+
+    // 取 KEY 后的 JSON 字符串值(处理转义), 上限 40 字符
+    private static String matchStr(String blockText, String KEY) {
+        int i = blockText.indexOf(KEY);
+        if (i < 0) return null;
+        int p = i + KEY.length();
+        StringBuilder sb = new StringBuilder(24);
+        while (p < blockText.length()) {
+            char c = blockText.charAt(p++);
+            if (c == '"') break;
+            if (c == '\\' && p < blockText.length()) {
+                c = blockText.charAt(p++);
+                if (c == 'n' || c == 't') c = ' ';
+            }
+            sb.append(c);
+            if (sb.length() >= 40) break;
+        }
+        String t = sb.toString().trim();
+        if (t.length() == 0) return null;
+        return t.replace('|', '／');
+    }
+
+    // 坏标题判定: 同一字符重复 ≥6(历史 bug 残留特征); 真实文案几乎不会这样
+    private static boolean isGarbageTitle(String t) {
+        if (t == null || t.length() < 6) return false;
+        char c0 = t.charAt(0);
+        for (int i = 1; i < t.length(); i++) {
+            if (t.charAt(i) != c0) return false;
+        }
+        return true;
+    }
+
+    private static String blockTitlesSerialize() {
+        StringBuilder sb = new StringBuilder();
+        synchronized (sBlockTitles) {
+            for (java.util.Map.Entry<String,String> en : sBlockTitles.entrySet()) {
+                if (sb.length() > 0) sb.append('\u0001');
+                Integer pr = sBlockTitlePrio.get(en.getKey());
+                sb.append(en.getKey()).append('|').append(pr == null ? 0 : pr.intValue())
+                  .append('|').append(en.getValue());
+            }
+        }
+        return sb.toString();
+    }
+
+    // 发现: 区块=累积(来源有多种响应: 页配置+feed, 只加不减); 卡片=替换(单一来源 DAILY 块, 跟随最近一次
+    // 响应 → 切换账号后自动对齐, 不残留其他账号的卡)(任意线程)
+    // resetBlocks=true: 重新发现按钮用 —— 先清空区块集再合并, 使清单=最近若干次落盘响应的并集
+    private static boolean homeDiscover(String json, boolean resetBlocks) {
+        BlocksScan sc = scanBlocks(json);
+        if (sc == null) { homeStructFail++; return false; }
+        homeStructFail = 0;
+        java.util.LinkedHashSet<String> seenB = resetBlocks
+                ? new java.util.LinkedHashSet<String>() : homeSeenBlockSet();
+        int bBefore = seenB.size();
+        java.util.LinkedHashMap<String,String[]> newT = new java.util.LinkedHashMap<String,String[]>();
+        for (int i = 0; i < sc.ranges.size(); i++) {
+            String code = sc.codes.get(i);
+            if (code == null || code.length() <= 3) continue;
+            seenB.add(code);   // 全部块都进清单(无文案的块如运营Banner也要能隐藏)
+            String[] bt = blockTitleOf(json.substring(sc.ranges.get(i)[0], sc.ranges.get(i)[1] + 1));
+            if (bt != null) newT.put(code, bt);
+        }
+        boolean titlesChanged = false;
+        synchronized (sBlockTitles) {
+            for (java.util.Map.Entry<String,String[]> en : newT.entrySet()) {
+                String code = en.getKey();
+                int p = en.getValue()[0].charAt(0) - '0';
+                String t = en.getValue()[1];
+                Integer cur = sBlockTitlePrio.get(code);
+                int curP = cur == null ? -1 : cur.intValue();
+                // 合并规则: 高优先级来源覆盖低(页配置响应的真标题不被 feed 的卡片名顶掉);
+                // 同级取最新(个性化文案保鲜)
+                if (p > curP) {
+                    sBlockTitlePrio.put(code, p);
+                    sBlockTitles.put(code, t);
+                    titlesChanged = true;
+                } else if (p == curP && !t.equals(sBlockTitles.get(code))) {
+                    sBlockTitles.put(code, t);
+                    titlesChanged = true;
                 }
-                if (firstBatch) homeCleanArmed = (cntKeep > 0);
-                flog("HOME_CLEAN", "白名单过滤: 块 " + ranges.size() + " → 保留 " + cntKeep + " " + kept
-                    + " / 删除 " + dropped + "  (" + json.length() + " → " + out.length() + " 字节)"
-                    + (cntKeep == 0 ? " + hasMore=false" : ""));
-                return out;
-            }
-            // 没配白名单 → 保留旧行为(首屏没命中就不动; 续页整批清)
-            if (firstBatch) { homeCleanArmed = false; return null; }
-            if (!homeCleanArmed) return null;
-            cutAt = 0;
-        } else if (firstBatch) {
-            homeCleanArmed = true;
-        }
-        int delStart = ranges.get(cutAt)[0];
-        int delEnd = ranges.get(ranges.size() - 1)[1];
-        String head = json.substring(0, delStart);
-        String tail = json.substring(delEnd + 1);
-        if (cutAt > 0) {
-            int k = head.length() - 1;
-            while (k >= 0 && Character.isWhitespace(head.charAt(k))) k--;
-            if (k >= 0 && head.charAt(k) == ',') {
-                int k2 = k - 1;
-                while (k2 >= 0 && Character.isWhitespace(head.charAt(k2))) k2--;
-                head = head.substring(0, k2 + 1) + " ";
             }
         }
-        String out = head + tail;
-        if (cutAt == 0) {
-            // 整批清空: 同时把 hasMore 置 false, 让客户端停止继续分页请求(否则滚到底会反复拉空批)
+        java.util.LinkedHashSet<String> oldC = new java.util.LinkedHashSet<String>();
+        for (String e : splitEntries(prefHomeSeenCards)) oldC.add(e);
+        java.util.LinkedHashSet<String> newC = new java.util.LinkedHashSet<String>();
+        String dailyText = null;
+        for (int i = 0; i < sc.ranges.size(); i++) {
+            if (DAILY_CODE.equals(sc.codes.get(i))) {
+                dailyText = json.substring(sc.ranges.get(i)[0], sc.ranges.get(i)[1] + 1);
+                break;
+            }
+        }
+        if (dailyText != null) {
+            java.util.ArrayList<int[]> elems = new java.util.ArrayList<int[]>();
+            scanResources(dailyText, elems);
+            for (int[] e : elems) {
+                String el = dailyText.substring(e[0], e[1] + 1);
+                String type = jsonField(el, "resourceType");
+                String sub = sanitize(jsonField(el, "subTitle"));
+                if (type == null || type.length() == 0) continue;
+                newC.add(type + "|" + sub);
+            }
+        }
+        java.util.LinkedHashSet<String> seenC = newC.isEmpty() ? oldC : newC;
+        if (seenB.size() != bBefore || !seenC.equals(oldC) || titlesChanged) {
+            android.content.Context c = dexCtx();
+            homeLastSeen = System.currentTimeMillis();
+            prefHomeSeenBlocks = joinColl(seenB);
+            prefHomeSeenCards = joinColl(seenC);
+            if (c != null) {
+                c.getSharedPreferences("cmhook_prefs", 0).edit()
+                 .putString("home_seen_blocks", prefHomeSeenBlocks)
+                 .putString("home_seen_cards", prefHomeSeenCards)
+                 .putString("cmhook_block_titles", blockTitlesSerialize())
+                 .putLong("home_last_seen", homeLastSeen)
+                 .commit();
+            }
+            flog("HOME_CLEAN", "发现更新: 区块 " + seenB.size() + " / 卡片 " + seenC.size()
+                 + " (home_last_seen 已更新)");
+        }
+        return true;
+    }
+
+    private static void homeDiscover(String json) { homeDiscover(json, false); }
+
+    // 精细改写: 块级隐藏集 + 顶部块卡片级隐藏集; 结构门/空页保底; 对首批与续页一视同仁
+    private static String filterHomeFeedFine(String json) {
+        BlocksScan sc = scanBlocks(json);
+        if (sc == null) {
+            homeStructFail++;
+            if (homeStructFail == 3) flog("HOME_CLEAN", "⚠️ 响应结构连续变化, 精细控制已旁路, 需要适配");
+            return null;
+        }
+        homeStructFail = 0;
+        java.util.HashSet<String> hideB = strSet(prefHomeHideBlocks);
+        if (prefHomeHideTopRow) hideB.add(DAILY_CODE);
+        java.util.HashSet<String> hideC = strSet(prefHomeHideCards);
+        StringBuilder sb = new StringBuilder();
+        sb.append(json, 0, sc.lb + 1);
+        int kept = 0, cardDrops = 0;
+        java.util.ArrayList<String> keptL = new java.util.ArrayList<String>();
+        java.util.ArrayList<String> dropL = new java.util.ArrayList<String>();
+        for (int i = 0; i < sc.ranges.size(); i++) {
+            int[] rg = sc.ranges.get(i);
+            String code = sc.codes.get(i);
+            String blockText = json.substring(rg[0], rg[1] + 1);
+            boolean hide = hideB.contains(code);
+            if (!hide && DAILY_CODE.equals(code) && !hideC.isEmpty()) {
+                java.util.ArrayList<int[]> elems = new java.util.ArrayList<int[]>();
+                int[] rs = scanResources(blockText, elems);
+                if (rs != null && !elems.isEmpty()) {
+                    StringBuilder nb = new StringBuilder(blockText.length());
+                    nb.append(blockText, 0, rs[0] + 1);
+                    boolean first = true;
+                    int dropE = 0;
+                    for (int[] e : elems) {
+                        String el = blockText.substring(e[0], e[1] + 1);
+                        String type = jsonField(el, "resourceType");
+                        String sub = sanitize(jsonField(el, "subTitle"));
+                        String key = (type == null ? "" : type) + "|" + sub;
+                        if (hideC.contains(key)) { dropE++; continue; }
+                        if (!first) nb.append(',');
+                        nb.append(el);
+                        first = false;
+                    }
+                    nb.append(blockText, rs[1], blockText.length());
+                    cardDrops += dropE;
+                    if (dropE > 0) {
+                        blockText = nb.toString();
+                        flog("HOME_CLEAN", "顶部卡片行: 隐藏 " + dropE + " 张卡 (" + (elems.size()) + "→" + (elems.size() - dropE) + ")");
+                    }
+                    if (first) { hide = true; }   // 全部卡片被隐藏 → 整行移除(保底4)
+                }
+            }
+            if (hide) {
+                dropL.add(String.valueOf(code));
+                continue;
+            }
+            if (kept > 0) sb.append(',');
+            sb.append(blockText);
+            kept++;
+            keptL.add(String.valueOf(code));
+        }
+        sb.append(json, sc.rb, json.length());
+        String out = sb.toString();
+        // v1.0.13: 操作者选择允许真空白 —— 全部块隐藏时首页推荐页为空; 置 hasMore=false 防止空页反复拉取
+        if (kept == 0) {
             out = out.replace("\"hasMore\":true", "\"hasMore\":false");
+            flog("HOME_CLEAN", "全部区块已隐藏 → 首页推荐页为空 (hasMore=false)");
         }
-        flog("HOME_CLEAN", "blocks " + ranges.size() + " 块 → 切除 " + (ranges.size() - cutAt) + " 块(第" + cutAt + "块起, code=" + codes.get(cutAt) + "), "
-            + json.length() + " → " + out.length() + " 字节");
+        // 只在有实际改动时记日志 —— 该函数每次首页响应/MMKV读取都会进, 无差别记会刷爆日志
+        if (out.length() != json.length()) {
+            flog("HOME_CLEAN", "精细过滤: 块 " + sc.ranges.size() + " → 保留 " + kept + " " + keptL
+                    + " / 隐藏 " + dropL + (cardDrops > 0 ? " / 卡片 -" + cardDrops : "")
+                    + "  (" + json.length() + " → " + out.length() + " 字节)");
+        }
         return out;
     }
+
 
     // 用新 JSON 重建 okhttp Response(4.x: ResponseBody.create + Response.newBuilder)
     // 说明: 全部走 java 反射(compile-only stub 里没有 callStaticMethod / setResult)
@@ -4779,7 +5524,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                     try {
                         cmForeground = true;
-                        try { flog("INIT", "onResume: " + param.thisObject.getClass().getName()); } catch (Throwable t0) { }
+                        try { flog("TRACE", "onResume: " + param.thisObject.getClass().getName()); } catch (Throwable t0) { }
                         applyHud();
                         if (param.thisObject.getClass().getName().startsWith("com.netease.cloudmusic")) {
                             // v6.4: 三个调用各自 try/catch 隔离(此前 applyTopTabs 抛异常会吞掉后面两个)
@@ -4810,7 +5555,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                         }
                                     }
                                 }
-                                flog("INIT", sb.toString());
+                                flog("TRACE", sb.toString());
                             } catch (Throwable tt) { }
                             // 入口芯片仅在设置页显示: 按 RN 模块名过滤(设置页 = rn-setting@...)
                             boolean isSetting = false;
@@ -5145,7 +5890,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                     flog("CMENC_IN", "" + param.args[0]);
-                    flog("CMENC_OUT", "" + param.result);
+                    flog("CMENC_OUT", truncN("" + param.result, 600));
                 }
             });
             flog("INIT", "hooked CMEncryptService");
@@ -5185,7 +5930,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                     StringBuilder args = new StringBuilder();
                     for (Object o : param.args) args.append(o).append(",");
-                    flog("NMU_SERIALDATA", "args=" + args + " ret=" + param.result);
+                    flog("NMU_SERIALDATA", truncN("args=" + args + " ret=" + param.result, 800));
                 }
             });
             XposedBridge.hookAllMethods(nmu, "serialurl", new XC_MethodHook() {
@@ -5325,20 +6070,19 @@ public class MainHook implements IXposedHookLoadPackage {
                                 && text.charAt(text.length() - 1) == '}') {
                             try {
                                 dumpFeed(url2, text);
+                                homeDiscover(text);   // v1.0.13: 发现式累积(总开关关闭时也发现)
                                 if (prefHomeClean) {
-                                    String filtered = filterHomeFeed(text);
+                                    String filtered = filterHomeFeedFine(text);
                                     if (filtered != null) {
                                         dumpFeedFiltered(filtered, feedDumpCount);
                                         Object nr = rebuildResponse(resp, filtered, cl);
                                         if (nr != null) setParamResult(param, nr);
-                                    } else {
-                                        flog("HOME_CLEAN", "未命中锚点(规则=[" + prefHomeCleanAnchor + "])");
                                     }
                                 }
                             } catch (Throwable th) { flog("HOME_CLEAN", "<err " + th + ">"); }
                         }
                         if (text == null) text = "?";
-                        flog("HTTP_RESP_BODY", text.length() > 200000 ? text.substring(0, 200000) + "...<len=" + text.length() + ">" : text);
+                        flog("HTTP_RESP_BODY", truncN(text, 1500));
                         // v20: 我的-播客-为你推荐 (xeapi/my/podcast/tab/recommend) → data[] 清空
                         if (url2 != null && url2.indexOf(PODCAST_REC_URL_KEY) >= 0 && prefPodcastClean) {
                             try {
@@ -5483,7 +6227,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         String s = (String) r;
                         if (s.length() < 2048) return;
                         if (s.indexOf("\"positionCode\"") < 0 || s.indexOf("\"blocks\"") < 0) return;
-                        String out = filterHomeFeed(s);
+                        String out = filterHomeFeedFine(s);
                         if (out != null && out.length() != s.length()) {
                             setParamResult(param, out);
                             flog("HOME_CLEAN", "MMKV 读取时过滤: " + s.length() + " → " + out.length() + " 字节");
@@ -5556,6 +6300,58 @@ public class MainHook implements IXposedHookLoadPackage {
             });
             flog("INIT", "hooked dispatchActivityResult (卡片选图回传)");
         } catch (Throwable t) { flog("INIT", "选图回传hook失败: " + t); }
+
+        // ===== 识曲入口(长按搜索区, v48 设计重制) =====
+        // kb v48 定稿: ACTION_DOWN 落在首页顶栏右上角搜索区(x>80%屏宽, y<300px), 按住 650ms 且位移<40px
+        // → startIdentify()。限定 MainActivity 避免其他页面误触。抬手/移动超限即取消。
+        try {
+            XposedHelpers.findAndHookMethod(android.app.Activity.class, "dispatchTouchEvent",
+                    android.view.MotionEvent.class, new XC_MethodHook() {
+                private boolean armed = false;
+                private float downX, downY;
+                private Runnable fire = null;
+                private final android.os.Handler main = new android.os.Handler(android.os.Looper.getMainLooper());
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    if (!prefIdentifyLongPress) return;
+                    if (!(param.thisObject instanceof android.app.Activity)) return;
+                    final android.app.Activity act = (android.app.Activity) param.thisObject;
+                    if (!act.getClass().getName().equals(TARGET_PKG + ".activity.MainActivity")) return;
+                    final android.view.MotionEvent ev = (android.view.MotionEvent) param.args[0];
+                    if (ev == null) return;
+                    switch (ev.getActionMasked()) {
+                        case android.view.MotionEvent.ACTION_DOWN: {
+                            armed = false;
+                            int sw = act.getResources().getDisplayMetrics().widthPixels;
+                            if (ev.getX() < sw * 0.80f || ev.getY() > 300) return;
+                            armed = true;
+                            downX = ev.getX(); downY = ev.getY();
+                            fire = new Runnable() { public void run() {
+                                if (!armed) return;
+                                armed = false;
+                                flog("IDENTIFY", "长按搜索区 → 听歌识曲");
+                                try { startIdentify(act); } catch (Throwable t) { flog("IDENTIFY", "启动失败: " + t); }
+                            }};
+                            main.postDelayed(fire, 650L);
+                            break;
+                        }
+                        case android.view.MotionEvent.ACTION_MOVE: {
+                            if (armed && (Math.abs(ev.getX() - downX) > 40 || Math.abs(ev.getY() - downY) > 40)) {
+                                armed = false;
+                                if (fire != null) main.removeCallbacks(fire);
+                            }
+                            break;
+                        }
+                        case android.view.MotionEvent.ACTION_UP:
+                        case android.view.MotionEvent.ACTION_CANCEL: {
+                            if (armed) { armed = false; if (fire != null) main.removeCallbacks(fire); }
+                            break;
+                        }
+                    }
+                }
+            });
+            flog("INIT", "hooked Activity.dispatchTouchEvent (长按搜索区=识曲)");
+        } catch (Throwable t) { flog("INIT", "长按识曲 hook 失败: " + t); }
 
         // ===== v57: 探针3 —— SQLite 层(不依赖类名) =====
         try {
