@@ -73,10 +73,11 @@ if ([string]::IsNullOrWhiteSpace($Device) -or $Device -eq "auto") {
 }
 Write-Host "目标设备: [$Device]"
 # 走 cmd /c 预拼命令行: PS5.1 下直接对 native 传 -r 会被吃掉
+# --no-incremental: 增量安装会让 LSPosed 模块路径跟踪失灵(模块静默不注入), 必须 streamed
 $adbLine = "adb -s $Device"
-$r1 = cmd /c "$adbLine install -r cmhook.apk 2>&1"
+$r1 = cmd /c "$adbLine install -r --no-incremental cmhook.apk 2>&1"
 $r1 | Select-Object -Last 4
 if ($LASTEXITCODE -ne 0) { throw "安装失败" }
 cmd /c "$adbLine shell am force-stop com.netease.cloudmusic" | Out-Null
-cmd /c "$adbLine shell `"dumpsys package com.rev.cmhook | grep -E 'versionName|versionCode'`""
+cmd /c "$adbLine shell `"dumpsys package io.github.justsoso17.cmhook | grep -E 'versionName|versionCode'`""
 Write-Host "`n构建完成 → $PSScriptRoot\cmhook.apk" -ForegroundColor Green
