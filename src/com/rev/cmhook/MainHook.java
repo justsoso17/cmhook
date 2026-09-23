@@ -77,7 +77,13 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean prefProtoCollect = true;  // v22: 协议采集(关=跳过采集hook与DexKit锚点搜索)
     private static volatile boolean prefFansHide = true;      // v31: 关注页隐藏「乐迷团」项
     private static volatile boolean prefCardCustom = true;    // v8.6: 抽屉VIP挽回卡替换为自定义内容
-    private static volatile boolean prefIdentifyLongPress = true;  // v48: 长按搜索区=听歌识曲
+    private static volatile boolean prefIdentifyLongPress = true;
+    private static volatile boolean prefDrawerClean = false;     // 抽屉侧栏菜单精简(隐藏 我的消息→我的客服)
+    private static volatile boolean prefBottomMidHide = false;   // 底栏中间入口(笔记/关注)隐藏
+    private static final java.util.ArrayList<android.view.View> sUiCleanHidden = new java.util.ArrayList<android.view.View>(); // 已隐藏的视图(开关关闭时恢复)
+    private static volatile long sLastUiScanSchedule = 0;
+    private static volatile String sTopActivity = "";   // onResume 跟踪(仅主界面做底栏/骨架清理)
+    private static final java.util.HashSet<android.view.View> sUiCleanPending = new java.util.HashSet<android.view.View>(); // 两次扫描确认的候选  // v48: 长按搜索区=听歌识曲
     private static volatile String prefUiCollapsed = "g3";          // v52: 面板折叠的组 id(逗号分隔)
     private static volatile ClassLoader businessCl = null;    // v22: 业务运行时加载器(供 UI 手动重建缓存用)
     private static volatile String prefTabsKeep = "";   // 保留的频道名逗号分隔, 空=全部保留
@@ -167,6 +173,24 @@ public class MainHook implements IXposedHookLoadPackage {
             prefFansHide = sp.getBoolean("fans_hide", true);
             prefCardCustom = sp.getBoolean("card_custom", true);
             prefIdentifyLongPress = sp.getBoolean("identify_longpress", true);
+            prefDrawerClean = sp.getBoolean("drawer_clean", false);
+            prefBottomMidHide = sp.getBoolean("bottom_mid_hide", false);
+            if (prefDrawerClean) {
+                // 抽屉菜单精简: 清除 H5 侧栏配置缓存 —— 抽屉是缓存优先渲染,
+                // 不清缓存的话会一直显示旧菜单 + 分组骨架条(白条也是配置里的 item)
+                try {
+                    new Thread(new Runnable() { public void run() {
+                        try {
+                            java.io.File f = new java.io.File("/data/data/" + TARGET_PKG + "/files/mmkv/h5kvCache");
+                            java.io.File crc = new java.io.File("/data/data/" + TARGET_PKG + "/files/mmkv/h5kvCache.crc");
+                            boolean gone = false;
+                            if (f.exists()) { gone = f.delete(); }
+                            if (crc.exists()) crc.delete();
+                            if (gone) flog("DRAWER", "已清除 h5kvCache(侧栏配置缓存, 网络层会写入已过滤的新配置)");
+                        } catch (Throwable t) { }
+                    } }, "cmhook-h5kv-purge").start();
+                } catch (Throwable t) { }
+            }
             prefUiCollapsed = sp.getString("ui_collapsed", "g3");
             prefHomeHideBlocks = homeHideNormalize(sp.getString("home_hide_blocks", HOME_HIDE_BLOCKS_DEFAULT));
             prefHomeHideCards = homeHideNormalize(sp.getString("home_hide_cards", ""));
@@ -430,6 +454,403 @@ public class MainHook implements IXposedHookLoadPackage {
                 }, 700L * k);
             }
         } catch (Throwable t) { }
+    }
+
+    // 开关关闭时尽量恢复已隐藏的视图(GONE/INVISIBLE 还原; alpha/颜色污染需重启完全恢复)
+    private static void restoreUiCleanViews() {
+        try {
+            for (android.view.View v : sUiCleanHidden) {
+                try { v.setAlpha(1f); v.setVisibility(android.view.View.VISIBLE); } catch (Throwable t) { }
+            }
+        } catch (Throwable t) { }
+        sUiCleanHidden.clear();
+        sUiCleanPending.clear();
+    }
+
+    // ===== 抽屉菜单精简 + 底栏中间入口隐藏 (TextView 扫描, 复用乐迷团引擎) =====
+    private static final String[] DRAWER_ITEM_TEXTS = {
+            "我的消息", "我的云贝", "装扮中心", "创作者中心", "最近播放",
+            "定时关闭", "商城", "云村有票", "云推歌", "我的客服"
+    };
+    private static final String[] BOTTOM_MID_TEXTS = { "笔记", "关注" };
+
+    private static boolean textInList(CharSequence t, String[] list) {
+        for (String s : list) if (s.contentEquals(t)) return true;
+        return false;
+    }
+
+    private static void scheduleUiCleanScan() {
+        if (!prefDrawerClean && !prefBottomMidHide) return;
+        long now = System.currentTimeMillis();
+        if (now - sLastUiScanSchedule < 1500) return;
+        sLastUiScanSchedule = now;
+        android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        long[] delays = {200, 600, 1200, 2200, 3600, 5500, 8000, 12000};
+        for (final long dd : delays) {
+            h.postDelayed(new Runnable() { public void run() { scanUiClean(); } }, dd);
+        }
+    }
+
+    private static void scanUiClean() {
+        try {
+            if (!(prefDrawerClean || prefBottomMidHide)) return;
+            int hid = 0;
+            java.util.List<android.view.View> roots = allWindowRoots();
+            int sh = android.content.res.Resources.getSystem().getDisplayMetrics().heightPixels;
+            int sw = android.content.res.Resources.getSystem().getDisplayMetrics().widthPixels;
+            boolean onMain = (TARGET_PKG + ".activity.MainActivity").equals(sTopActivity);
+            for (android.view.View root : roots) {
+                // 只扫主窗口: 对话框/浮窗/HUD 窗口一律不碰(防误伤模块面板等)
+                if (root.getWidth() < sw * 0.95) continue;
+                // 抽屉/底栏都在主界面上; 其他页面(如设置页)一律不处理, 杜绝误伤
+                if (!onMain) return;
+                java.util.ArrayList<android.widget.TextView> out = new java.util.ArrayList<android.widget.TextView>();
+                if (prefDrawerClean) {
+                    collectMatchingTexts(root, out);
+                    for (android.widget.TextView tv : out) {
+                        if (!textInList(tv.getText(), DRAWER_ITEM_TEXTS)) continue;
+                        android.view.View row = rowOf(tv, 4);
+                        if (row == null) row = tv;
+                        // 真移除(不可点/不占位); 父容器重建行时 setText 探针会再触发本轮清除
+                        if (row.getParent() instanceof android.view.ViewGroup) {
+                            ((android.view.ViewGroup) row.getParent()).removeView(row);
+                            hid++;
+                            if (!sUiCleanChainLogged) {
+                                sUiCleanChainLogged = true;
+                                logUiChain(row);
+                            }
+                        } else {
+                            row.setVisibility(android.view.View.GONE);
+                            fadeView(row);
+                        }
+                    }
+                    // 骨架/分隔线清扫: 菜单清空后抽屉模板仍会画骨架条/分隔线
+                    // (限定在抽屉页容器内处理, 且只动"无文字子树", 不碰有内容的视图)
+                    cleanDrawerSkeletons(root, sh, sw);
+                }
+                if (prefBottomMidHide) {
+                    int k = hideBottomMid(root, sh, sw);
+                    if (k == 0 && !sUiCleanBarDbg) {
+                        // 诊断: 打印屏幕底部区域的宽容器(找底栏真实结构)
+                        java.util.ArrayList<String> dbg = new java.util.ArrayList<String>();
+                        collectBottomCandidates(root, sh, sw, dbg);
+                        if (!dbg.isEmpty()) {
+                            sUiCleanBarDbg = true;
+                            for (String d : dbg) flog("SET", "底栏诊断: " + d);
+                        }
+                    }
+                    hid += k;
+                }
+            }
+            if (hid > 0) flog("SET", "界面清理: 本次隐藏 " + hid + " 个视图");
+        } catch (Throwable t) { }
+    }
+
+    private static volatile boolean sUiCleanBarDbg = false;
+
+    // 诊断: 收集底部 12% 区域里宽度 ≥80%屏 的容器(类名/尺寸/子数), 最多 8 条
+    private static void collectBottomCandidates(android.view.View v, int sh, int sw, java.util.List<String> out) {
+        if (out.size() >= 8 || v == null || !(v instanceof android.view.ViewGroup)) return;
+        android.view.ViewGroup g = (android.view.ViewGroup) v;
+        int w = g.getWidth(), h = g.getHeight();
+        int[] loc = new int[2];
+        g.getLocationOnScreen(loc);
+        if (w >= sw * 0.8 && h > 0 && h <= 400 && loc[1] + h >= sh * 0.85) {
+            out.add("<" + g.getClass().getSimpleName() + " " + w + "x" + h + " y=" + loc[1]
+                    + " kids=" + g.getChildCount() + ">");
+        }
+        for (int i = 0; i < g.getChildCount(); i++) collectBottomCandidates(g.getChildAt(i), sh, sw, out);
+    }
+
+    // 底栏中间入口: 按结构找(底栏= 宽≥90%屏 / 高60~300 / 贴屏底 / 恰3个子项), 隐藏中间子项
+    // (底栏是纯图标样式没有文字, 且中间可能是「笔记」或「关注」, 文字匹配不可靠)
+    private static int hideBottomMid(android.view.View v, int sh, int sw) {
+        int n = 0;
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            int w = g.getWidth(), h = g.getHeight();
+            int[] loc = new int[2];
+            g.getLocationOnScreen(loc);
+            // y 在屏幕下 20% 即认底栏(不比对手势条高度差; getSystem() 高度与实际布局可能差一个手势条)
+            boolean barLike = w >= sw * 0.9 && h >= 60 && h <= 300 && loc[1] >= sh * 0.8;
+            if (barLike) {
+                int kids = g.getChildCount();
+                if (kids == 3 && !hasBigImage(g, 0)) {
+                    // 三 tab 图标栏 → 隐藏中间(有封面大图的播放条不是底栏, 跳过)
+                    android.view.View mid = g.getChildAt(1);
+                    if (mid.getVisibility() != android.view.View.GONE) {
+                        mid.setVisibility(android.view.View.GONE);
+                        collapseView(mid);
+                        if (!sUiCleanHidden.contains(mid)) sUiCleanHidden.add(mid);
+                        n++;
+                        if (!sUiCleanChainLogged) {
+                            sUiCleanChainLogged = true;
+                            logUiChain(g);
+                        }
+                    }
+                    return n;
+                }
+                // 四 tab 文字栏(首页/搜索/笔记/我的) → 隐藏含「笔记/关注」文字的子项
+                for (int i = 0; i < kids; i++) {
+                    android.view.View c = g.getChildAt(i);
+                    if (subtreeHasAnyText(c, BOTTOM_MID_TEXTS, 0)) {
+                        c.setVisibility(android.view.View.GONE);
+                        collapseView(c);
+                        if (!sUiCleanHidden.contains(c)) sUiCleanHidden.add(c);
+                        n++;
+                        return n;
+                    }
+                }
+                return n;
+            }
+            for (int i = 0; i < g.getChildCount(); i++) n += hideBottomMid(g.getChildAt(i), sh, sw);
+        }
+        return n;
+    }
+
+    // 子树里是否有文本精确命中 texts(限深 8)
+    private static boolean subtreeHasAnyText(android.view.View v, String[] texts, int depth) {
+        if (v instanceof android.widget.TextView) {
+            CharSequence cs = ((android.widget.TextView) v).getText();
+            if (cs != null && textInList(cs, texts)) return true;
+            return false;
+        }
+        if (v instanceof android.view.ViewGroup && depth < 8) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                if (subtreeHasAnyText(g.getChildAt(i), texts, depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    // 子树里是否有大尺寸 ImageView(≥90×90, 播放条封面特征; 底栏 tab 图标没这么大)
+    private static boolean hasBigImage(android.view.View v, int depth) {
+        if (v instanceof android.widget.ImageView) {
+            int w = v.getWidth(), h = v.getHeight();
+            if (w >= 90 && h >= 90) return true;
+        }
+        if (v instanceof android.view.ViewGroup && depth < 8) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                if (hasBigImage(g.getChildAt(i), depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static void logUiChain(android.view.View row) {
+        try {
+            StringBuilder sb = new StringBuilder("UI清理链: ");
+            android.view.View v = row;
+            for (int i = 0; i < 7 && v != null; i++) {
+                sb.append('<').append(v.getClass().getSimpleName())
+                  .append(' ').append(v.getWidth()).append('x').append(v.getHeight()).append("> ");
+                android.view.ViewParent vp = v.getParent();
+                v = vp instanceof android.view.View ? (android.view.View) vp : null;
+            }
+            flog("SET", sb.toString());
+        } catch (Throwable t) { }
+    }
+
+    // 收集 root 子树里文本精确命中的 TextView
+    private static void collectMatchingTexts(android.view.View v, java.util.ArrayList<android.widget.TextView> out) {
+        if (v instanceof android.widget.TextView) {
+            CharSequence cs = ((android.widget.TextView) v).getText();
+            if (cs != null && cs.length() > 0 && cs.length() <= 12
+                    && (textInList(cs, DRAWER_ITEM_TEXTS) || textInList(cs, BOTTOM_MID_TEXTS))) {
+                out.add((android.widget.TextView) v);
+            }
+            return;
+        }
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) collectMatchingTexts(g.getChildAt(i), out);
+        }
+    }
+
+    // 抽屉菜单数组精确清除: 只清空"内容含 side_bar_new_first 的 dataGroupResourceList 数组",
+    // 同响应里其他配置数组(如设置页菜单)原样保留; 无可清数组返回 null
+    // 逐条目清理: 遍历每个 dataGroupResourceList 数组的顶层条目, 只移除含 side_bar_new_first
+    // 的条目(侧栏菜单项), 同数组/同响应里其他页面的条目原样保留; 无可清条目返回 null
+    private static String clearDrawerArrays(String json) {
+        String result = json;
+        int cleared = 0;
+        int idx = 0;
+        while (true) {
+            int k = result.indexOf("\"dataGroupResourceList\":", idx);
+            if (k < 0) break;
+            int lb = result.indexOf('[', k);
+            if (lb < 0) break;
+            int depth = 0;
+            boolean inStr = false, esc = false;
+            int end = -1;
+            for (int p = lb; p < result.length(); p++) {
+                char c = result.charAt(p);
+                if (inStr) {
+                    if (esc) esc = false;
+                    else if (c == '\\') esc = true;
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (c == '"') { inStr = true; continue; }
+                if (c == '[') depth++;
+                else if (c == ']') {
+                    depth--;
+                    if (depth == 0) { end = p; break; }
+                }
+            }
+            if (end < 0) break;
+            String arr = result.substring(lb, end + 1);
+            String filtered = filterDrawerArrayEntries(arr);
+            if (filtered.length() != arr.length()) {
+                result = result.substring(0, lb) + filtered + result.substring(end + 1);
+                cleared++;
+                idx = lb + filtered.length();
+            } else {
+                idx = end + 1;
+            }
+        }
+        if (cleared == 0) return null;
+        return result;
+    }
+
+    // 过滤单个数组: 拆出顶层 {} 条目, 剔除含 side_bar_new_first 的(侧栏菜单项)
+    private static String filterDrawerArrayEntries(String arr) {
+        java.util.ArrayList<String> keptEntries = new java.util.ArrayList<String>();
+        int depth = 0, start = -1;
+        boolean inStr = false, esc = false;
+        for (int p = 1; p < arr.length() - 1; p++) {
+            char c = arr.charAt(p);
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{') { if (depth == 0) start = p; depth++; continue; }
+            if (c == '}') {
+                depth--;
+                if (depth == 0 && start >= 0) { keptEntries.add(arr.substring(start, p + 1)); start = -1; }
+                continue;
+            }
+        }
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        for (String e : keptEntries) {
+            if (e.indexOf("side_bar_new_first") >= 0) continue;   // 侧栏条目 → 剔除
+            if (!first) sb.append(',');
+            sb.append(e);
+            first = false;
+        }
+        sb.append(']');
+        return sb.toString();
+    }
+
+    // 子树里是否存在非空文字(有文字的视图可能是合法内容, 不能动)
+    private static boolean containsTextDeep(android.view.View v) {
+        if (v instanceof android.widget.TextView) {
+            CharSequence cs = ((android.widget.TextView) v).getText();
+            return cs != null && cs.length() > 0;
+        }
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                if (containsTextDeep(g.getChildAt(i))) return true;
+            }
+        }
+        return false;
+    }
+
+    // 骨架/分隔线清扫: 定位抽屉页容器(「设置」文本上溯, 宽<95%屏 即非全屏页), 隐去其中所有无文字子树
+    // (菜单清空后抽屉模板仍画骨架条/分隔线; 有文字的视图永不触碰)
+    private static void cleanDrawerSkeletons(android.view.View root, int sh, int sw) {
+        android.view.View set = findByTextEquals(root, "设置", 0);
+        if (set == null) return;
+        android.view.View cur = set;
+        android.view.ViewGroup page = null;
+        for (int i = 0; i < 8 && cur != null; i++) {
+            android.view.ViewParent vp = cur.getParent();
+            if (!(vp instanceof android.view.View)) break;
+            android.view.View p = (android.view.View) vp;
+            // 抽屉页: 宽在 60%~95% 屏(全屏页如 rn-setting 宽=100% 屏, 排除), 高≥50% 屏
+            if (p.getWidth() >= sw * 0.6 && p.getWidth() < sw * 0.95 && p.getHeight() >= sh * 0.5) {
+                page = (android.view.ViewGroup) p;
+                break;
+            }
+            cur = p;
+        }
+        if (page == null) return;
+        hideNoTextSubtrees(page, sh, sw, 0);
+    }
+
+    // 递归: 含文字的容器继续深入; 无文字且尺寸像骨架/分隔线的子树 → INVISIBLE+fade 整体隐去
+    private static void hideNoTextSubtrees(android.view.View v, int sh, int sw, int depth) {
+        if (v == null || depth > 25) return;
+        int w = v.getWidth(), h = v.getHeight();
+        if (w <= 0 || h <= 0) return;
+        if (containsTextDeep(v)) {
+            sUiCleanPending.remove(v);
+            if (v instanceof android.view.ViewGroup) {
+                android.view.ViewGroup g = (android.view.ViewGroup) v;
+                for (int i = 0; i < g.getChildCount(); i++) hideNoTextSubtrees(g.getChildAt(i), sh, sw, depth + 1);
+            }
+            return;
+        }
+        if (h <= 400 && w >= sw * 0.5) {
+            // 两次扫描确认: 首轮仅登记(防"文字未绑完"的竞态误伤), 连续两轮仍无文字才隐去
+            if (!sUiCleanPending.contains(v)) {
+                sUiCleanPending.add(v);
+                return;
+            }
+            if (v.getVisibility() != android.view.View.INVISIBLE) {
+                v.setVisibility(android.view.View.INVISIBLE);
+                fadeView(v);
+                if (!sUiCleanHidden.contains(v)) sUiCleanHidden.add(v);
+            }
+            return;   // 已整体隐去, 不再深入
+        }
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) hideNoTextSubtrees(g.getChildAt(i), sh, sw, depth + 1);
+        }
+    }
+
+    // 收集抽屉区域(左 60% 屏)里的"无文字占位视图"(高≤200, 宽≥50%屏) —— 菜单清空后模板的加载态/分隔残骸
+    private static void collectThinLines(android.view.View v, int sh, int sw, java.util.List<android.view.View> out, int depth) {
+        if (v == null || depth > 30 || out.size() >= 12) return;
+        int w = v.getWidth(), h = v.getHeight();
+        boolean isVG = v instanceof android.view.ViewGroup;
+        if (w > 0 && h > 0 && h <= 200 && w >= sw * 0.5) {
+            int[] loc = new int[2];
+            v.getLocationOnScreen(loc);
+            boolean noText = !(v instanceof android.widget.TextView)
+                    || ((android.widget.TextView) v).getText() == null
+                    || ((android.widget.TextView) v).getText().length() == 0;
+            if (noText && loc[0] < sw * 0.6 && loc[1] > sh * 0.12 && loc[1] < sh * 0.9) out.add(v);
+        }
+        if (isVG) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) collectThinLines(g.getChildAt(i), sh, sw, out, depth + 1);
+        }
+    }
+
+    // 从文本向上找"行容器": 高度不超过文本高度的 maxRatio 倍的最高层祖先
+    private static android.view.View rowOf(android.widget.TextView tv, int maxRatio) {
+        int th = tv.getHeight();
+        if (th <= 0) return null;
+        android.view.View cur = tv, best = null;
+        for (int i = 0; i < 6; i++) {
+            android.view.ViewParent vp = cur.getParent();
+            if (!(vp instanceof android.view.View)) break;
+            android.view.View p = (android.view.View) vp;
+            int ph = p.getHeight();
+            if (ph <= 0 || ph > th * maxRatio) break;
+            best = p;
+            cur = p;
+        }
+        return best;
     }
 
     // ===== v15: 标题栏剩余频道居中 — 改用分叉原生 GRAVITY_CENTER 机制 =====
@@ -2430,6 +2851,10 @@ public class MainHook implements IXposedHookLoadPackage {
             g1.add(miRow(act, "长按搜索=识曲", "顶栏搜索区长按进听歌识曲", swLp));
             android.widget.Switch swCard = miSwitch(act, prefCardCustom);
             g1.add(miRow(act, "抽屉VIP卡自定义", "替换抽屉顶部VIP挽回卡(图片放 files/cmhook_drawer_card.png)", swCard));
+            android.widget.Switch swDrawer = miSwitch(act, prefDrawerClean);
+            g1.add(miRow(act, "抽屉菜单精简", "隐藏抽屉侧栏菜单项(我的消息→我的客服), 重启恢复", swDrawer));
+            android.widget.Switch swBottomMid = miSwitch(act, prefBottomMidHide);
+            g1.add(miRow(act, "隐藏底栏中间入口", "隐藏底栏中间的「笔记/关注」tab, 重启恢复", swBottomMid));
             addGroup(act, panel, d, "g1", "界面与清理", false, g1, 0);
 
             // ---------- 抽屉VIP卡图片: 预览 + 选图 (v8.7) ----------
@@ -2600,6 +3025,22 @@ public class MainHook implements IXposedHookLoadPackage {
                 public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
                     prefCardCustom = checked; savePref(act, "card_custom", checked);
                     flog("SET", "抽屉VIP卡自定义 -> " + checked + (checked ? " (重进抽屉生效)" : ""));
+                }
+            });
+            swDrawer.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                    prefDrawerClean = checked; savePref(act, "drawer_clean", checked);
+                    if (checked) scheduleUiCleanScan();
+                    else restoreUiCleanViews();
+                    flog("SET", "抽屉菜单精简 -> " + checked);
+                }
+            });
+            swBottomMid.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                    prefBottomMidHide = checked; savePref(act, "bottom_mid_hide", checked);
+                    if (checked) scheduleUiCleanScan();
+                    else restoreUiCleanViews();
+                    flog("SET", "隐藏底栏中间入口 -> " + checked);
                 }
             });
             swAd.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
@@ -5054,6 +5495,16 @@ public class MainHook implements IXposedHookLoadPackage {
     // resources[] 里的 title 是卡片/tab 名(安分守己/摇滚榜), 刻意不取。
     // org.json 是框架类运行时必有, 但编译用 android.jar 是裁剪版 → 反射调用; 解析失败退化到首个 "title"
     private static volatile boolean sTitleDbg = false;
+    private static volatile boolean sUiCleanChainLogged = false;
+
+    // RN/Yoga 忽略 GONE 时, 把布局参数高度清零并触发重排(原生父容器会真正收回空间)
+    private static void collapseView(android.view.View v) {
+        try {
+            android.view.ViewGroup.LayoutParams lp = v.getLayoutParams();
+            if (lp != null) { lp.height = 0; v.setLayoutParams(lp); }
+            v.requestLayout();
+        } catch (Throwable t) { }
+    }
 
     private static String[] blockTitleOf(String blockText) {
         int p3 = -1, p2 = -1;
@@ -5539,7 +5990,11 @@ public class MainHook implements IXposedHookLoadPackage {
                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                     try {
                         cmForeground = true;
-                        try { flog("TRACE", "onResume: " + param.thisObject.getClass().getName()); } catch (Throwable t0) { }
+                        try {
+                            sTopActivity = param.thisObject.getClass().getName();
+                            flog("TRACE", "onResume: " + sTopActivity);
+                        } catch (Throwable t0) { }
+                        try { scheduleUiCleanScan(); } catch (Throwable t0) { }
                         applyHud();
                         if (param.thisObject.getClass().getName().startsWith("com.netease.cloudmusic")) {
                             // v6.4: 三个调用各自 try/catch 隔离(此前 applyTopTabs 抛异常会吞掉后面两个)
@@ -6111,6 +6566,22 @@ public class MainHook implements IXposedHookLoadPackage {
                                 }
                             } catch (Throwable t4) { flog("PODCAST_CLEAN", "<err " + t4 + ">"); }
                         }
+                        // v1.0.5: 抽屉侧栏菜单源头清理 — link/position/show/resource 的
+                        // positionCode=side_bar_new_first 响应里, dataGroupResourceList 就是
+                        // 「我的消息→我的客服」整段菜单(服务端下发)。清空后抽屉原生不渲染。
+                        // 注意: 同端点也下发其他页面的配置(如设置页), 只清"数组内容含
+                        // side_bar_new_first 的那些数组", 其他数组一律保留(否则误清设置页菜单)。
+                        if (prefDrawerClean && url2 != null && url2.indexOf("link/position/show/resource") >= 0
+                                && text != null && text.indexOf("side_bar_new_first") >= 0) {
+                            try {
+                                String out5 = clearDrawerArrays(text);
+                                if (out5 != null && out5.length() != text.length()) {
+                                    flog("DRAWER", "抽屉菜单服务端配置已清空: " + text.length() + " → " + out5.length() + " 字节");
+                                    Object nr5 = rebuildResponse(resp, out5, cl);
+                                    if (nr5 != null) setParamResult(param, nr5);
+                                }
+                            } catch (Throwable t5) { flog("DRAWER", "<err " + t5 + ">"); }
+                        }
                         // v8.2: 开屏广告网络层拦截 — 9.5.96 开屏广告走 /eapi|xeapi/ad/loading/get(展示)
                         // 与 /ad/loading/bidget(预取) 两个端点, 且素材预取完成时 LoadingAdManager.E
                         // 根本不被调用(老 hook 零命中)。把顶层 ads[] 清成 [] = 服务端自己的"无广告"
@@ -6231,7 +6702,6 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                     try {
-                        if (!prefHomeClean) return;
                         Object r = null;   // stub 里没有 getResult() → 纯反射拿返回值
                         try {
                             java.lang.reflect.Method gm = param.getClass().getMethod("getResult");
@@ -6240,6 +6710,17 @@ public class MainHook implements IXposedHookLoadPackage {
                         } catch (Throwable t) { return; }
                         if (!(r instanceof String)) return;
                         String s = (String) r;
+                        // 抽屉侧栏配置缓存(h5kvCache)读取时过滤 —— 必须在 prefHomeClean 门控之前:
+                        // 缓存优先渲染, 网络层过滤拦不住这条读路径
+                        if (prefDrawerClean && s.indexOf("side_bar_new_first") >= 0 && s.indexOf("dataGroupResourceList") >= 0) {
+                            String out5 = clearDrawerArrays(s);
+                            if (out5 != null && out5.length() != s.length()) {
+                                setParamResult(param, out5);
+                                flog("DRAWER", "侧栏缓存读取时过滤: " + s.length() + " → " + out5.length() + " 字节");
+                                return;
+                            }
+                        }
+                        if (!prefHomeClean) return;
                         if (s.length() < 2048) return;
                         if (s.indexOf("\"positionCode\"") < 0 || s.indexOf("\"blocks\"") < 0) return;
                         String out = filterHomeFeedFine(s);
@@ -6268,13 +6749,17 @@ public class MainHook implements IXposedHookLoadPackage {
                         Object a0 = param.args[0];
                         String t = a0 instanceof CharSequence ? a0.toString() : null;
                         if (t == null || t.length() == 0 || t.length() > 40) return;
+                        // UI 清理触发: 抽屉菜单项 / 底栏中间 tab 文本绑定时排扫描
+                        if ((prefDrawerClean && textInList(t, DRAWER_ITEM_TEXTS))
+                                || (prefBottomMidHide && textInList(t, BOTTOM_MID_TEXTS))) {
+                            scheduleUiCleanScan();
+                        }
                         boolean hit = t.contains("期待您的回归") || t.contains("特权已失效") || t.contains("续费立享")
                                 || t.contains("会员特权") || t.contains("每日打卡") || t.contains("学生特惠")
                                 || t.contains("优惠开通") || t.contains("立享优惠");
                         if (!hit) return;
                         long now = System.currentTimeMillis();
-                        if (now - lastLog < 2000) return;
-                        lastLog = now;
+                        if (now - lastLog < 2000) return;                        lastLog = now;
                         StringBuilder sb = new StringBuilder("命中[" + t + "] 链:");
                         android.view.View v = (android.view.View) param.thisObject;
                         for (int i = 0; i < 10 && v != null; i++) {
@@ -6328,6 +6813,14 @@ public class MainHook implements IXposedHookLoadPackage {
                 private final android.os.Handler main = new android.os.Handler(android.os.Looper.getMainLooper());
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    // UI 清理触发: 每次按下屏幕都重排一次扫描窗口(抽屉/底栏内容可能滞后挂载)
+                    try {
+                        Object e0 = param.args != null && param.args.length > 0 ? param.args[0] : null;
+                        if (e0 instanceof android.view.MotionEvent
+                                && ((android.view.MotionEvent) e0).getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
+                            scheduleUiCleanScan();
+                        }
+                    } catch (Throwable t) { }
                     if (!prefIdentifyLongPress) return;
                     if (!(param.thisObject instanceof android.app.Activity)) return;
                     final android.app.Activity act = (android.app.Activity) param.thisObject;
