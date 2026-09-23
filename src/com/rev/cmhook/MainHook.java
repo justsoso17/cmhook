@@ -541,8 +541,21 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // v22: 丢单个缓存键(自愈: 兜底 0 命中 / 缓存值失效时调用)
-    private static void dexCacheDrop(String key) {
+    // 9.6.05 修复: 本函数会被 installBusinessHooks(主线程)触发 —— 严禁在主线程等 Context,
+    // 主线程一律转后台线程去丢(旧行为: 主线程 dexCtxBlocking 3s×N → 启动 ANR → 被系统杀 = 闪退)
+    private static void dexCacheDrop(final String key) {
         try {
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                new Thread(new Runnable() { public void run() {
+                    try {
+                        android.content.Context c = dexCtxBlocking();
+                        if (c == null) return;
+                        c.getSharedPreferences(DEXKIT_PREFS, 0).edit().remove(dexDomainKey() + "|" + key).commit();
+                        flog("DEXKIT", "缓存已丢弃 " + key + " (后台)");
+                    } catch (Throwable t) { }
+                } }, "cmhook-dexdrop").start();
+                return;
+            }
             android.content.Context c = dexCtxBlocking();
             if (c == null) return;
             c.getSharedPreferences(DEXKIT_PREFS, 0).edit().remove(dexDomainKey() + "|" + key).commit();
@@ -691,7 +704,9 @@ public class MainHook implements IXposedHookLoadPackage {
         if (dexCacheInitTried) return;
         synchronized (MainHook.class) {
             if (dexCacheInitTried) return;
-            android.content.Context c = dexCtxBlocking();
+            // 9.6.05 修复: 主线程(钩子安装期)绝不阻塞等 Context —— 立即推迟; 后台线程保留阻塞等待(兼容旧时序)
+            boolean mainThread = android.os.Looper.myLooper() == android.os.Looper.getMainLooper();
+            android.content.Context c = mainThread ? dexCtx() : dexCtxBlocking();
             if (c == null) throw new IllegalStateException("宿主Context未就绪, 推迟DexKit初始化");   // 不落 /data/local/tmp, 不建错域缓存
             dexCacheInitTried = true;
             try {
