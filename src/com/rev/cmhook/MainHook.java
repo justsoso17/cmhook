@@ -460,7 +460,11 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void restoreUiCleanViews() {
         try {
             for (android.view.View v : sUiCleanHidden) {
-                try { v.setAlpha(1f); v.setVisibility(android.view.View.VISIBLE); } catch (Throwable t) { }
+                try {
+                    sUiCleanHidden.remove(v);   // 先出集合, 否则保护 hook 会把 VISIBLE 改写回 GONE
+                    v.setAlpha(1f);
+                    v.setVisibility(android.view.View.VISIBLE);
+                } catch (Throwable t) { }
             }
         } catch (Throwable t) { }
         sUiCleanHidden.clear();
@@ -575,8 +579,28 @@ public class MainHook implements IXposedHookLoadPackage {
             boolean barLike = w >= sw * 0.9 && h >= 60 && h <= 300 && loc[1] >= sh * 0.8;
             if (barLike) {
                 int kids = g.getChildCount();
-                if (kids == 3 && !hasBigImage(g, 0)) {
-                    // 三 tab 图标栏 → 隐藏中间(有封面大图的播放条不是底栏, 跳过)
+                // ① 语义匹配优先(最稳): 文本 或 无障碍描述 命中「笔记/关注」
+                //    ⚠️ 9.6.x 底栏(GaiaX 化)标签只写在 contentDescription, 旧实现只查 TextView 文本 → 永不命中
+                for (int i = 0; i < kids; i++) {
+                    android.view.View c = g.getChildAt(i);
+                    if (subtreeHasAnyText(c, BOTTOM_MID_TEXTS, 0) || subtreeHasAnyDesc(c, BOTTOM_MID_TEXTS, 0)) {
+                        if (c.getVisibility() != android.view.View.GONE) {
+                            c.setVisibility(android.view.View.GONE);
+                            collapseView(c);
+                            if (!sUiCleanHidden.contains(c)) sUiCleanHidden.add(c);
+                            n++;
+                            if (!sUiCleanChainLogged) {
+                                sUiCleanChainLogged = true;
+                                logUiChain(g);
+                            }
+                        }
+                        return n;
+                    }
+                }
+                // ② 三 tab 图标栏(纯图标无文字) → 隐藏中间子项
+                //    ⚠️ 播放条封面否决只认"大图且占容器高 ≥62%": 560dpi 下底栏 tab 图标就已 98px,
+                //       旧的 ≥90px 判据会把底栏误判成播放条 → 中间 tab 永不隐藏
+                if (kids == 3 && !hasCoverImage(g, 0, h)) {
                     android.view.View mid = g.getChildAt(1);
                     if (mid.getVisibility() != android.view.View.GONE) {
                         mid.setVisibility(android.view.View.GONE);
@@ -590,22 +614,42 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                     return n;
                 }
-                // 四 tab 文字栏(首页/搜索/笔记/我的) → 隐藏含「笔记/关注」文字的子项
-                for (int i = 0; i < kids; i++) {
-                    android.view.View c = g.getChildAt(i);
-                    if (subtreeHasAnyText(c, BOTTOM_MID_TEXTS, 0)) {
-                        c.setVisibility(android.view.View.GONE);
-                        collapseView(c);
-                        if (!sUiCleanHidden.contains(c)) sUiCleanHidden.add(c);
-                        n++;
-                        return n;
-                    }
-                }
                 return n;
             }
             for (int i = 0; i < g.getChildCount(); i++) n += hideBottomMid(g.getChildAt(i), sh, sw);
         }
         return n;
+    }
+
+    // 子树里是否有 contentDescription 精确命中 texts(限深 8)
+    // (9.6.x 底栏/部分 RN 节点的可见标签只登记在无障碍描述里, 文本为空)
+    private static boolean subtreeHasAnyDesc(android.view.View v, String[] texts, int depth) {
+        if (v == null) return false;
+        CharSequence cd = v.getContentDescription();
+        if (cd != null && textInList(cd, texts)) return true;
+        if (v instanceof android.view.ViewGroup && depth < 8) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                if (subtreeHasAnyDesc(g.getChildAt(i), texts, depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    // 播放条封面特征: 大图(≥90×90) 且 高度占容器 ≥62%
+    // (底栏 tab 图标 98px 但只占 189 高的 ~52%; 播放条封面 ~168/217 ≈ 77% → 以此区分, 不用绝对像素单条件)
+    private static boolean hasCoverImage(android.view.View v, int depth, int containerH) {
+        if (v instanceof android.widget.ImageView) {
+            int w = v.getWidth(), h = v.getHeight();
+            if (w >= 90 && h >= 90 && containerH > 0 && h >= containerH * 0.62f) return true;
+        }
+        if (v instanceof android.view.ViewGroup && depth < 8) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                if (hasCoverImage(g.getChildAt(i), depth + 1, containerH)) return true;
+            }
+        }
+        return false;
     }
 
     // 子树里是否有文本精确命中 texts(限深 8)
@@ -895,6 +939,14 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile android.content.Context dexHostCtx = null;   // Application.attach 时抓到的宿主 Context
     private static volatile String dexDomain = null;
     private static volatile boolean dexCacheInitTried = false;
+    // v1.0.9: 区分"查询没跑成"(宿主 Context/dexkit 未就绪, 可重试) 与 "真 0 命中(该丢缓存)"
+    //   主线程早于 Application.attach 时 dexCacheGet 拿不到 Context → 旧实现把这种失败当 0 命中,
+    //   于是每轮冷启动都把有效缓存丢掉(实测 9.6.05: 密钥锚点缓存反复被清)
+    private static volatile long sDexTransientFailAt = 0L;
+    // v1.0.11: ENCODE 密钥 hook 是否已装上(硬编码或 DexKit 任一路径成功)。主线程安装期宿主 Context 常未就绪,
+    //   9.6.05 上硬编码 i42.f/n62.f 已失效(实际 l42.f) → 只能靠 DexKit, 那会儿读不到缓存 → 密钥采集整轮缺失;
+    //   由后台 L1(此时 Context 必就绪)按缓存补装。
+    private static volatile boolean sEncodeKeyHooked = false;
     private static volatile org.luckypray.dexkit.DexKitCacheBridge.RecyclableBridge dexRb = null;
 
     private static android.content.Context dexCtx() {
@@ -998,15 +1050,35 @@ public class MainHook implements IXposedHookLoadPackage {
         else if (methodsResolvable(cl, splitCache(rev))) ok++;
         else { bad++; dexCacheDrop("revoke"); }
         String kk = dexCacheGet("m:xorDecode(ENCODE_SIGN_KEY)");
-        if (kk == null) missing++;
-        else if (methodsResolvable(cl, splitCache(kk))) ok++;
-        else { bad++; dexCacheDrop("m:xorDecode(ENCODE_SIGN_KEY)"); }
+        String kk2 = dexCacheGet("m:xorDecode(ENCODE_STATIC_KEY)");
+        if (kk == null && kk2 == null) missing++;
+        else if ((kk == null || methodsResolvable(cl, splitCache(kk)))
+                && (kk2 == null || methodsResolvable(cl, splitCache(kk2)))) ok++;
+        else {
+            bad++;
+            if (kk != null && !methodsResolvableQuiet(cl, kk)) dexCacheDrop("m:xorDecode(ENCODE_SIGN_KEY)");
+            if (kk2 != null && !methodsResolvableQuiet(cl, kk2)) dexCacheDrop("m:xorDecode(ENCODE_STATIC_KEY)");
+        }
         // v8.1: 私信库 DAO 兜底锚点(消息防撤回胶囊的读库路径)
         String dao = dexCacheGet("m:private_chat_message_db");
         if (dao == null) missing++;
         else if (methodsResolvable(cl, splitCache(dao))) ok++;
         else { bad++; dexCacheDrop("m:private_chat_message_db"); }
-        return "有效" + ok + "/4 失效" + bad + " 缺缓存" + missing + dexHealthSkipNote();
+        // v1.0.9: xorDecode 解码器锚点(协议采集开关下)
+        if (prefProtoCollect) {
+            String xd = dexCacheGet("xor:p");
+            if (xd == null) missing++;
+            else if (methodsResolvable(cl, splitCache(xd))) ok++;
+            else { bad++; dexCacheDrop("xor:p"); }
+        }
+        // v1.0.9: 广告渠道闸门锚点(去广告开关下)
+        if (prefAdBlock) {
+            String gate = dexCacheGet("m:Session.Account");
+            if (gate == null) missing++;
+            else if (methodsResolvable(cl, splitCache(gate))) ok++;
+            else { bad++; dexCacheDrop("m:Session.Account"); }
+        }
+        return "有效" + ok + "/6 失效" + bad + " 缺缓存" + missing + dexHealthSkipNote();
     }
 
     // v22: 让"开关对齐"可观测 —— 报告哪些锚点因开关关闭被跳过(不搜 dex)
@@ -1017,6 +1089,36 @@ public class MainHook implements IXposedHookLoadPackage {
         return sb.length() == 0 ? "" : (" |" + sb);
     }
 
+    // v1.0.11: 用结果级缓存里的锚点补装 ENCODE 密钥 hook(主线程安装期 Context 未就绪时的后台补装路径)
+    private static int hookEncodeKeysFromCache(ClassLoader cl) {
+        int n = 0;
+        String[][] pairs = {
+            {"m:xorDecode(ENCODE_SIGN_KEY)", "ENCODE_SIGN_KEY"},
+            {"m:xorDecode(ENCODE_STATIC_KEY)", "ENCODE_STATIC_KEY"}
+        };
+        for (String[] pr : pairs) {
+            String cached = dexCacheGet(pr[0]);
+            if (cached == null) continue;
+            for (String h : splitCache(cached)) {
+                String[] cm = splitHit(h);
+                if (cm[0].length() == 0) continue;
+                final String tag = pr[1];
+                try {
+                    XposedBridge.hookAllMethods(cl.loadClass(cm[0]), cm[1], new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            flog(tag, "" + param.result);
+                        }
+                    });
+                    n++;
+                    flog("INIT", "后台补装: hooked " + tag + " @ " + h);
+                } catch (Throwable t) { }
+            }
+        }
+        if (n > 0) sEncodeKeyHooked = true;
+        return n;
+    }
+
     // 缓存里的 "类#方法(参数)" 是否仍能在运行时 dex 中解析出同名方法与类
     private static boolean methodsResolvable(ClassLoader cl, String[] hits) {
         if (hits == null || hits.length == 0) return false;
@@ -1024,13 +1126,31 @@ public class MainHook implements IXposedHookLoadPackage {
             String[] cm = splitHit(hits[i]);
             if (cm[0].length() == 0) return false;
             try {
+                Class<?> kc = cl.loadClass(cm[0]);
                 boolean found = false;
-                java.lang.reflect.Method[] ms = cl.loadClass(cm[0]).getDeclaredMethods();
-                for (int j = 0; j < ms.length; j++) if (ms[j].getName().equals(cm[1])) { found = true; break; }
+                // v1.0.9: DexKit 的 hit 可能是构造器(jk.a#<init>([])), getDeclaredMethods 不含 <init> → 会误判失效
+                if ("<init>".equals(cm[1]) || "<clinit>".equals(cm[1])) {
+                    found = kc.getDeclaredConstructors().length > 0;
+                } else {
+                    java.lang.reflect.Method[] ms = kc.getDeclaredMethods();
+                    for (int j = 0; j < ms.length; j++) if (ms[j].getName().equals(cm[1])) { found = true; break; }
+                }
                 if (!found) return false;
             } catch (Throwable t) { return false; }
         }
         return true;
+    }
+
+    // v1.0.13: 静默版 methodsResolvable(供健康检查判定"到底哪个键失效")
+    private static boolean methodsResolvableQuiet(ClassLoader cl, String cached) {
+        try { return methodsResolvable(cl, splitCache(cached)); } catch (Throwable t) { return false; }
+    }
+
+    // v1.0.9: 本轮 DexKit 查询是否"根本没跑成"(Context/dexkit 未就绪) —— 这种空结果不能当 0 命中丢缓存
+    private static boolean dexQueryWasTransient() {
+        boolean trans = System.currentTimeMillis() - sDexTransientFailAt < 15000;
+        if (trans) flog("DEXKIT", "跳过丢缓存: 本轮查询未执行成功(Context/dexkit 未就绪), 保留有效缓存等下轮");
+        return trans;
     }
 
     // v22 L2(手动): 清缓存 + 立刻真搜重建(设置面板「重建 DexKit 缓存」)
@@ -1054,6 +1174,10 @@ public class MainHook implements IXposedHookLoadPackage {
                     flog("DEXKIT", "重建: 频道基类=" + (b != null ? b.getName() : "未命中"));
                     flog("DEXKIT", "重建: 防撤回=" + dexkitFindRevokeHandlers(cl).length + " 处");
                     flog("DEXKIT", "重建: 密钥=" + dexkitFindMethodsByString(cl, "xorDecode(ENCODE_SIGN_KEY)").length + " 处");
+                    // v1.0.9: 原 L2 漏掉三个锚点, 手动重建后它们仍是缺缓存状态
+                    flog("DEXKIT", "重建: 私信DAO=" + dexkitFindMethodsByString(cl, "private_chat_message_db").length + " 处");
+                    flog("DEXKIT", "重建: 解码器(xor:p)=" + dexkitFindMethodsByStringNmuP(cl).length + " 处");
+                    flog("DEXKIT", "重建: 渠道闸门=" + dexkitFindMethodsByString(cl, "Session.Account").length + " 处");
                     flog("DEXKIT", "重建完毕(" + (System.currentTimeMillis() - t0) + "ms), 域=" + dexDomainKey());
                     toast(ctxF, "DexKit 缓存重建完成 (" + (System.currentTimeMillis() - t0) + "ms)");
                 } catch (Throwable t2) {
@@ -1068,15 +1192,31 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static String dexCacheGet(String key) {
         try {
-            android.content.Context c = dexCtxBlocking();   // 时序兜底: 自检线程可能早于 Application.attach
+            android.content.Context c = dexCtxForCache();   // v1.0.9: 主线程不再 3s 阻塞(冷启动实测 2×3s)
             if (c == null) return null;
             return c.getSharedPreferences(DEXKIT_PREFS, 0).getString(dexDomainKey() + "|" + key, null);
         } catch (Throwable t) { return null; }
     }
 
+    // v1.0.9: 缓存专用 Context 获取 —— 主线程最多等 400ms(冷启动期 Context 常未就绪), 后台最多 3s;
+    //   拿不到就标记"本轮不可用(transient)": 查询失败不当 0 命中, 由后台 L1 预热补缓存
+    private static android.content.Context dexCtxForCache() {
+        android.content.Context c = dexCtx();
+        if (c != null) return c;
+        boolean mainThread = android.os.Looper.myLooper() == android.os.Looper.getMainLooper();
+        int wait = mainThread ? 8 : 60;      // ×50ms → 主线程 400ms / 后台 3s
+        for (int i = 0; i < wait; i++) {
+            try { Thread.sleep(50); } catch (Throwable t) { }
+            c = dexCtx();
+            if (c != null) return c;
+        }
+        sDexTransientFailAt = System.currentTimeMillis();
+        return null;
+    }
+
     private static void dexCachePut(String key, String value) {
         try {
-            android.content.Context c = dexCtxBlocking();
+            android.content.Context c = dexCtxForCache();   // v1.0.9: 同上, 主线程不阻塞 3s
             if (c == null || value == null) return;
             android.content.SharedPreferences sp = c.getSharedPreferences(DEXKIT_PREFS, 0);
             String prefix = dexDomainKey() + "|";
@@ -1201,15 +1341,22 @@ public class MainHook implements IXposedHookLoadPackage {
                 java.util.ArrayList<String> out = new java.util.ArrayList<String>();
                 int start = 0;
                 for (int i = 0; i <= s.length(); i++) {
-                    if (i == s.length() || s.charAt(i) == '\n') { out.add(s.substring(start, i)); start = i + 1; }
+                    // 修复(2026-09-24): 跳过空段 —— 旧写者在末尾补 '\n', 切分后多出一个空串元素;
+                    // DexKit 回读缓存按描述符解析该空串 → StringIndexOutOfBoundsException: length=0; index=0
+                    // → 读缓存即抛 = 兜底通道全灭。读侧修复同时治好设备上已有的脏缓存文件。
+                    if (i == s.length() || s.charAt(i) == '\n') {
+                        if (i > start) out.add(s.substring(start, i));
+                        start = i + 1;
+                    }
                 }
                 return out;
             } catch (Throwable t) { return defValue; }
         }
         public void putStringList(String key, java.util.List<String> value) {
             try {
+                // 修复(2026-09-24): 不再写尾分隔符(与结果级缓存 joinCache 口径一致)
                 StringBuilder sb = new StringBuilder();
-                for (String v : value) sb.append(v).append('\n');
+                for (int i = 0; i < value.size(); i++) { if (i > 0) sb.append('\n'); sb.append(value.get(i)); }
                 write(file(key), sb.toString());
             } catch (Throwable t) { }
         }
@@ -1251,6 +1398,45 @@ public class MainHook implements IXposedHookLoadPackage {
             return hits.toArray(new String[hits.size()]);
         } catch (Throwable t) {
             flog("DEXKIT", "查询失败 " + ck + ": " + t);
+            if (t instanceof IllegalStateException) sDexTransientFailAt = System.currentTimeMillis();
+            return new String[0];
+        }
+    }
+
+    // DexKit: xorDecode 解码器反查(行为锚点 = 调用 NeteaseMusicUtils.p([BI)[B), 结果落结果级缓存 "xor:p"
+    // (与 installBusinessHooks 里的内联实现同键同格式, 两条路径共用缓存)
+    private static String[] dexkitFindMethodsByStringNmuP(ClassLoader cl) {
+        final String ck = "xor:p";
+        String cached = dexCacheGet(ck);
+        if (cached != null) {
+            flog("DEXKIT", "结果级缓存命中 " + ck + " → " + cached.replace("\n", " | "));
+            return splitCache(cached);
+        }
+        try {
+            org.luckypray.dexkit.DexKitCacheBridge.RecyclableBridge rb = dexBridge(cl);
+            java.util.List<org.luckypray.dexkit.wrap.DexMethod> list = rb.getMethods(
+                new org.luckypray.dexkit.DexKitCacheBridge.RecyclableBridge.FindMethodBuilder() {
+                    public void build(org.luckypray.dexkit.query.FindMethod fm) {
+                        fm.matcher(new org.luckypray.dexkit.query.matchers.MethodMatcher()
+                            .addInvoke("Lcom/netease/cloudmusic/utils/NeteaseMusicUtils;->p([BI)[B"));
+                    }
+                });
+            java.util.ArrayList<String> hits = new java.util.ArrayList<String>();
+            if (list != null) {
+                for (org.luckypray.dexkit.wrap.DexMethod md : list) {
+                    String cn2 = md.getClassName();
+                    if (cn2 == null || !cn2.startsWith("com.netease.cloudmusic.utils.")) continue;
+                    java.util.List<String> ps = md.getParamTypeNames();
+                    if (ps == null || ps.size() != 1 || !"java.lang.String".equals(ps.get(0))) continue;
+                    hits.add(cn2 + "#" + md.getName() + "(java.lang.String)");
+                }
+            }
+            dexCachePut(ck, joinCache(hits));
+            flog("DEXKIT", "查询并落缓存 " + ck + " → " + hits.size() + " 处");
+            return hits.toArray(new String[hits.size()]);
+        } catch (Throwable t) {
+            flog("DEXKIT", "查询失败 " + ck + ": " + t);
+            if (t instanceof IllegalStateException) sDexTransientFailAt = System.currentTimeMillis();
             return new String[0];
         }
     }
@@ -3522,6 +3708,7 @@ public class MainHook implements IXposedHookLoadPackage {
             return hits.toArray(new String[hits.size()]);
         } catch (Throwable t) {
             flog("DEXKIT", "防撤回查询失败: " + t);
+            if (t instanceof IllegalStateException) sDexTransientFailAt = System.currentTimeMillis();
             return new String[0];
         }
     }
@@ -3801,6 +3988,81 @@ public class MainHook implements IXposedHookLoadPackage {
     // 会话 → (msgId → 文本): 上轮库内容(源③)
     private static final java.util.HashMap<String, java.util.LinkedHashMap<String, String>> RV_DBSEEN =
             new java.util.HashMap<String, java.util.LinkedHashMap<String, String>>();
+
+    // v1.0.15: 会话 → 本会话已见 msgId 集合。**台账归属改按 msgId 判定**:
+    //   库里的 (userId, channelId) 两列约定在不同会话间不一致(实测有的会话存 userId=我/channelId=对方,
+    //   有的会话反过来存 userId=对方/channelId=我) → 同一会话的历史台账会被分到两个 channel 桶里,
+    //   聊天页按当前 channel 查就恒为 0(胶囊空)。只要消息出现在本会话的列表/库读结果里, 即算本会话。
+    private static final java.util.HashMap<String, java.util.LinkedHashSet<String>> RV_IDS =
+            new java.util.HashMap<String, java.util.LinkedHashSet<String>>();
+
+    private static void rvNoteIds(String ch, java.util.Collection<String> ids) {
+        if (ch == null || ch.length() == 0 || ids == null || ids.isEmpty()) return;
+        synchronized (RV_IDS) {
+            java.util.LinkedHashSet<String> set = RV_IDS.get(ch);
+            if (set == null) { set = new java.util.LinkedHashSet<String>(); RV_IDS.put(ch, set); }
+            for (String s : ids) if (s != null && s.length() > 0) set.add(s);
+            while (set.size() > 3000) {
+                java.util.Iterator<String> it = set.iterator();
+                if (!it.hasNext()) break;
+                it.next();
+                it.remove();
+            }
+        }
+    }
+
+    private static boolean rvBelongsTo(String ch, String msgId) {
+        if (ch == null || ch.length() == 0 || msgId == null) return false;
+        synchronized (RV_IDS) {
+            java.util.LinkedHashSet<String> set = RV_IDS.get(ch);
+            return set != null && set.contains(msgId);
+        }
+    }
+
+    // ===== v1.0.17: "自己 vs 对方"判据重做 =====
+    //   旧判据 `senderId == 会话id 即对方` 在 9.6.x 失效 —— 模块拿到的会话 id 有时是对方、
+    //   有时被解析成我自己, 于是"我自己发的"被当成对方的消息记进台账(实测误记过一条本人消息)。
+    //   改为跟**自身 userId** 比; 自身 userId 从库里推定: 每一行不管哪一列写的是我, 我的 id 都会出现一次
+    //   (801/801), 对方 id 只出现在自己那几行 → 两列合并计数取最大者即"我"。
+    private static volatile String rvMyId = null;
+
+    private static String rvResolveMyId(android.database.sqlite.SQLiteDatabase db) {
+        String cached = rvMyId;
+        if (cached != null) return cached;
+        android.database.Cursor c = null;
+        try {
+            c = db.rawQuery("select userId, channelId from private_chat_message_db limit 800", null);
+            java.util.HashMap<String, Integer> cnt = new java.util.HashMap<String, Integer>();
+            while (c.moveToNext()) {
+                for (int i = 0; i < 2; i++) {
+                    String v = c.isNull(i) ? null : c.getString(i);
+                    if (v == null || v.length() == 0) continue;
+                    Integer n = cnt.get(v);
+                    cnt.put(v, n == null ? 1 : n + 1);
+                }
+            }
+            String best = null;
+            int bestN = 0;
+            for (java.util.Map.Entry<String, Integer> e : cnt.entrySet()) {
+                if (e.getValue() > bestN) { bestN = e.getValue(); best = e.getKey(); }
+            }
+            if (best != null && bestN >= 3) {
+                rvMyId = best;
+                flog("ANTIREVOKE", "自身 userId 推定: " + best + " (" + bestN + " 次/两列合并)");
+            }
+            return rvMyId;
+        } catch (Throwable t) { return null; } finally {
+            try { if (c != null) c.close(); } catch (Throwable t) { }
+        }
+    }
+
+    // 是否"自己发出的"(自己撤回不记)。优先用推定的自身 userId; 未推定时回退旧判据(senderId != 会话id 即自己)
+    private static boolean rvIsMine(String sid, String ch) {
+        if (sid == null || sid.length() == 0) return false;
+        String me = rvMyId;
+        if (me != null) return sid.equals(me);
+        return ch != null && ch.length() > 0 && !sid.equals(ch);
+    }
 
     private static Object rvCall(Object o, String m) {
         if (o == null) return null;
@@ -4159,7 +4421,21 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // 读库: j30.a#w(IMChat, status=0, limit=1000, desc=true)   status 0 = 本地库正常消息行(实机库核对)
+    // v1.0.15: 宿主 DAO 路径优先, 但它"成功返回 0 条"时必须直连 SQLite 兜底
+    //   (9.6.05 实测: l30.a#w 的 SQL 是 `userId=? AND channelId=? AND status=?`, 而模块自建/陈旧 DAO 实例的
+    //    userId 与库里的不一致 → 恒 0 条 → ②库窗口/③库条目 两条记账源全灭 → 胶囊恒空)
     private static java.util.List<?> rvQueryDb(String channelId) {
+        if (channelId == null || channelId.length() == 0) return null;
+        // v1.0.18: 直连 SQL 优先 —— 它是"按会话完整取行", 而宿主 DAO 的 userId 过滤会给出不稳定子集;
+        //   两者混用会让源③快照忽大忽小 → 假的"库条目消失"(实测曾误记 5 条)。固定数据源 = 不产生假阳性。
+        java.util.List<?> viaSql = rvQueryDbDirect(channelId);
+        if (viaSql != null && !viaSql.isEmpty()) return viaSql;
+        java.util.List<?> viaDao = rvQueryDbViaDao(channelId);
+        if (viaDao != null && !viaDao.isEmpty()) return viaDao;
+        return viaSql;
+    }
+
+    private static java.util.List<?> rvQueryDbViaDao(String channelId) {
         if (channelId == null || channelId.length() == 0) return null;
         try {
             if (rvDaoCls == null || rvDaoW == null) rvResolveDao(businessCl);
@@ -4185,6 +4461,209 @@ public class MainHook implements IXposedHookLoadPackage {
             flog("ANTIREVOKE", "库: 返回 " + dl);
         } catch (Throwable t) { flog("ANTIREVOKE", "库读异常: " + t); }
         return null;
+    }
+
+    // ===== v1.0.15: 直连 SQLite 兜底(不依赖任何混淆类/实例状态) =====
+    //   cloudmusic.db 是明文库(已实机核对: private_chat_message_db, 801 行 status=0);
+    //   按 channelId + status=0 直接查, 比宿主 DAO 少一个 userId 约束 —— 而 userId 正是 9.6.05 上不匹配的那一维。
+    private static volatile String rvDbPath = null;
+    private static volatile String rvDbCopyPath = null;
+    private static volatile long rvDbCopyAt = 0L;
+
+    private static java.util.List<?> rvQueryDbDirect(String channelId) {
+        if (channelId == null || channelId.length() == 0) return null;
+        // v1.0.18: 会话 id 若等于"我自己"(宿主偶发把 channel 解析成自身 id), 按它查会一次拉出全部会话 → 拒绝
+        String meNow = rvMyId;
+        if (meNow != null && meNow.equals(channelId)) {
+            flog("ANTIREVOKE", "直连SQL: 会话id=" + channelId + " 等于自身 userId, 跳过(无法区分会话)");
+            return null;
+        }
+        android.database.Cursor cur = null;
+        android.database.sqlite.SQLiteDatabase db = null;
+        try {
+            String path = rvResolveDbPath();
+            if (path == null) { flog("ANTIREVOKE", "直连SQL: 未找到 cloudmusic.db"); return null; }
+            try {
+                db = android.database.sqlite.SQLiteDatabase.openDatabase(path, null,
+                        android.database.sqlite.SQLiteDatabase.OPEN_READONLY);
+            } catch (Throwable tOpen) {
+                String cp = rvDbCopy(path);      // 热 journal/锁竞争 → 拷一份读
+                if (cp == null) { flog("ANTIREVOKE", "直连SQL 打开失败且拷贝失败: " + tOpen); return null; }
+                db = android.database.sqlite.SQLiteDatabase.openDatabase(cp, null,
+                        android.database.sqlite.SQLiteDatabase.OPEN_READONLY);
+            }
+            rvResolveMyId(db);                   // v1.0.17: 顺便推定自身 userId(自己/对方判据用)
+            if (rvMyId != null && rvMyId.equals(channelId)) {   // v1.0.18: 会话id==自身 → 无法区分会话, 不查
+                flog("ANTIREVOKE", "直连SQL: 会话id 等于自身 userId(" + channelId + "), 跳过");
+                return null;
+            }
+            cur = db.rawQuery("select msgId, senderId, sendTime, briefText, msgStr from private_chat_message_db"
+                    + " where channelId=? and status=0 order by sendTime desc limit 1000", new String[]{channelId});
+            if (cur.getCount() == 0) {                 // v1.0.15: 该会话在库里可能是"两列反向"存储(userId=对方)
+                cur.close();
+                cur = db.rawQuery("select msgId, senderId, sendTime, briefText, msgStr from private_chat_message_db"
+                        + " where userId=? and status=0 order by sendTime desc limit 1000", new String[]{channelId});
+                if (cur.getCount() > 0) flog("ANTIREVOKE", "直连SQL: 会话 " + channelId + " 命中反向列(userId) " + cur.getCount() + " 行");
+            }
+            java.util.ArrayList<RvRow> out = new java.util.ArrayList<RvRow>();
+            while (cur.moveToNext()) {
+                String mid = cur.isNull(0) ? "" : cur.getString(0);
+                String sid = cur.isNull(1) ? "" : cur.getString(1);
+                long ts = cur.isNull(2) ? 0L : cur.getLong(2);
+                String brief = cur.isNull(3) ? null : cur.getString(3);
+                String raw = cur.isNull(4) ? null : cur.getString(4);
+                String nick = null, text = brief, sid2 = sid;
+                if (raw != null && raw.length() > 0) {
+                    try {
+                        Object jo = joNew(raw);
+                        Object mb = joGetObj(jo, "msgBody");
+                        if (mb != null) {
+                            if (text == null || text.length() == 0) text = joStr(mb, "briefText");
+                            Object sender = joGetObj(mb, "sender");
+                            Object user = (sender == null) ? null : joGetObj(sender, "user");
+                            if (user != null) {
+                                String nk = joStr(user, "nickname");
+                                if (nk != null && nk.length() > 0) nick = nk;
+                                String uid = joStr(user, "userId");
+                                if ((sid2 == null || sid2.length() == 0) && uid != null) sid2 = uid;
+                            }
+                        }
+                    } catch (Throwable t) { }
+                }
+                out.add(new RvRow(mid, sid2 == null ? "" : sid2, ts, text, nick));
+            }
+            if (!out.isEmpty()) {
+                long now = System.currentTimeMillis();
+                if (now - rvLastDbLog > 60000L) {
+                    rvLastDbLog = now;
+                    flog("ANTIREVOKE", "库读直连SQL: " + out.size() + " 条 (channelId=" + channelId + ")");
+                }
+            }
+            return out;
+        } catch (Throwable t) {
+            flog("ANTIREVOKE", "库读直连SQL异常: " + t);
+            return null;
+        } finally {
+            try { if (cur != null) cur.close(); } catch (Throwable t) { }
+            try { if (db != null) db.close(); } catch (Throwable t) { }
+        }
+    }
+
+    // v1.0.19: ③ 记账前的复核 —— 直接按 msgId 再查一次; 行还在 = 上一次读取残缺(假阳性), 不记账。
+    //   (实机教训: 同一会话先后走了 DAO 子集与直连全量两个数据源, 快照忽大忽小 → 误记 5 条"库条目消失"，
+    //    而复核显示这些 msgId 从未离开过库)
+    private static boolean rvDbHasMsgId(String msgId) {
+        if (msgId == null || msgId.length() == 0) return false;
+        android.database.Cursor c = null;
+        android.database.sqlite.SQLiteDatabase db = null;
+        try {
+            String path = rvResolveDbPath();
+            if (path == null) return false;
+            try {
+                db = android.database.sqlite.SQLiteDatabase.openDatabase(path, null,
+                        android.database.sqlite.SQLiteDatabase.OPEN_READONLY);
+            } catch (Throwable t) {
+                String cp = rvDbCopy(path);
+                if (cp == null) return false;
+                db = android.database.sqlite.SQLiteDatabase.openDatabase(cp, null,
+                        android.database.sqlite.SQLiteDatabase.OPEN_READONLY);
+            }
+            c = db.rawQuery("select count(*) from private_chat_message_db where msgId=?", new String[]{msgId});
+            return c.moveToNext() && c.getLong(0) > 0;
+        } catch (Throwable t) { return false; } finally {
+            try { if (c != null) c.close(); } catch (Throwable t) { }
+            try { if (db != null) db.close(); } catch (Throwable t) { }
+        }
+    }
+
+    private static String rvResolveDbPath() {
+        String p = rvDbPath;
+        if (p != null) return p;
+        try {
+            android.content.Context c = dexCtx();
+            if (c != null) {
+                java.io.File f = c.getDatabasePath("cloudmusic.db");
+                if (f != null && f.exists()) { rvDbPath = f.getAbsolutePath(); return rvDbPath; }
+            }
+        } catch (Throwable t) { }
+        return null;
+    }
+
+    private static String rvDbCopy(String src) {
+        try {
+            long now = System.currentTimeMillis();
+            String cp = rvDbCopyPath;
+            if (cp != null && now - rvDbCopyAt < 60000L && new java.io.File(cp).exists()) return cp;
+            android.content.Context c = dexCtx();
+            if (c == null) return null;
+            java.io.File dir = new java.io.File(c.getCacheDir(), "rvdb");
+            dir.mkdirs();
+            java.io.File dst = new java.io.File(dir, "cloudmusic.db");
+            rvCopyFile(new java.io.File(src), dst);
+            rvCopyFile(new java.io.File(src + "-journal"), new java.io.File(dst.getAbsolutePath() + "-journal"));
+            rvCopyFile(new java.io.File(src + "-wal"), new java.io.File(dst.getAbsolutePath() + "-wal"));
+            rvCopyFile(new java.io.File(src + "-shm"), new java.io.File(dst.getAbsolutePath() + "-shm"));
+            rvDbCopyPath = dst.getAbsolutePath();
+            rvDbCopyAt = now;
+            return rvDbCopyPath;
+        } catch (Throwable t) { return null; }
+    }
+
+    private static void rvCopyFile(java.io.File src, java.io.File dst) {
+        if (src == null || !src.exists()) return;
+        java.io.FileInputStream in = null;
+        java.io.FileOutputStream out = null;
+        try {
+            in = new java.io.FileInputStream(src);
+            out = new java.io.FileOutputStream(dst, false);
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        } catch (Throwable t) {
+        } finally {
+            try { if (in != null) in.close(); } catch (Throwable t) { }
+            try { if (out != null) out.close(); } catch (Throwable t) { }
+        }
+    }
+
+    // 直连SQL 的行对象: getter 命名与宿主 RawMessage 对齐 → 下游 rvCall 反射无缝复用
+    private static final class RvRow {
+        final String msgId, senderId, text, nick;
+        final long ts;
+        RvRow(String id, String sid, long t, String txt, String nk) {
+            msgId = id; senderId = sid; ts = t; text = txt; nick = nk;
+        }
+        public String getId() { return msgId; }
+        public long getMsgTime() { return ts; }
+        public Object getMsgBody() { return new RvBody(senderId, text, nick); }
+    }
+
+    private static final class RvBody {
+        final String sid, text, nick;
+        RvBody(String s, String t, String n) { sid = s; text = t; nick = n; }
+        public String getBriefText() { return text; }
+        public Object getBody() { return new RvText(text); }
+        public Object getSender() { return new RvSender(sid, nick); }
+    }
+
+    private static final class RvText {
+        final String t;
+        RvText(String s) { t = s; }
+        public String getText() { return t; }
+    }
+
+    private static final class RvSender {
+        final String sid, nick;
+        RvSender(String s, String n) { sid = s; nick = n; }
+        public Object getUser() { return new RvUser(sid, nick); }
+        public String getUserId() { return sid; }
+    }
+
+    private static final class RvUser {
+        final String sid, nick;
+        RvUser(String s, String n) { sid = s; nick = n; }
+        public String getUserId() { return sid; }
+        public String getNickname() { return nick; }
     }
 
     private static String rvTextOf(Object item) {
@@ -4230,7 +4709,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 String sid = sep > 0 ? v.substring(0, sep) : "";
                 String body = sep > 0 ? v.substring(sep + 1) : v;
                 it.remove();
-                if (sid.length() > 0 && ch.length() > 0 && !sid.equals(ch)) {
+                if (rvIsMine(sid, ch)) {            // v1.0.17: 按自身 userId 判定"自己发的"
                     flog("ANTIREVOKE", "列表消失但是自己发的, 跳过: " + body);
                     continue;
                 }
@@ -4249,7 +4728,7 @@ public class MainHook implements IXposedHookLoadPackage {
             if (!curIds.contains(mid)) continue;
             synchronized (seen) { if (seen.containsKey(mid)) continue; }
             String sid = rvSenderIdOf(item);
-            if (sid.length() > 0 && ch.length() > 0 && !sid.equals(ch)) continue;
+            if (rvIsMine(sid, ch)) continue;           // v1.0.17: 只把对方的消息写进"见过"表
             String body = rvTextFor(item);
             if (body == null) continue;
             synchronized (seen) {
@@ -4282,13 +4761,14 @@ public class MainHook implements IXposedHookLoadPackage {
                     maxMatched = i;
                 }
             }
-            // ③ 库条目消失(先取本轮库中含文本的快照, 再比对上一轮)
+            rvNoteIds(ch, ids);            // v1.0.15: 库里的 id 也归属本会话(两列约定不一致的兜底)
+            // ③ 库条目消失(先取本轮库中含文本的快照, 再比对上一轮) —— v1.0.17: 快照带发信人, 自己发的不记
             java.util.LinkedHashMap<String, String> curDb = new java.util.LinkedHashMap<String, String>();
             for (int i = 0; i < db.size(); i++) {
                 String mid = ids.get(i);
                 if (mid == null) continue;
                 String body = rvTextFor(db.get(i));
-                if (body != null) curDb.put(mid, body);
+                if (body != null) curDb.put(mid, rvSenderIdOf(db.get(i)) + "\u0001" + body);
             }
             java.util.LinkedHashMap<String, String> prev;
             synchronized (RV_DBSEEN) {
@@ -4301,9 +4781,21 @@ public class MainHook implements IXposedHookLoadPackage {
                         java.util.Map.Entry<String, String> e = it.next();
                         if (curDb.containsKey(e.getKey())) continue;
                         it.remove();
-                        rvRecord(e.getKey(), ch, e.getValue());
+                        String pv = e.getValue();
+                        int ps = pv.indexOf('\u0001');
+                        String psid = (ps > 0) ? pv.substring(0, ps) : "";
+                        String ptext = (ps >= 0) ? pv.substring(ps + 1) : pv;
+                        if (rvIsMine(psid, ch)) {          // v1.0.17: 自己发的消息从库里消失 ≠ 被对方撤回
+                            flog("ANTIREVOKE", "③ 库条目消失但是自己发的, 跳过: " + ptext);
+                            continue;
+                        }
+                        if (rvDbHasMsgId(e.getKey())) {    // v1.0.19: 复核, 行仍在 = 上次读取残缺, 不记账
+                            flog("ANTIREVOKE", "③ 复核: 行仍在库中(读取残缺), 跳过: " + ptext);
+                            continue;
+                        }
+                        rvRecord(e.getKey(), ch, ptext);
                         added++;
-                        flog("ANTIREVOKE", "③ 库条目消失→记账: " + e.getValue());
+                        flog("ANTIREVOKE", "③ 库条目消失→记账: " + ptext);
                     }
                 }
                 prev.putAll(curDb);
@@ -4324,7 +4816,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (rvHasRecord(mid)) continue;          // 已入台账 → 不重复解析(5s 一轮)
                     Object it = db.get(i);
                     String sid = rvSenderIdOf(it);
-                    if (sid.length() > 0 && ch.length() > 0 && !sid.equals(ch)) continue;   // 自己撤回不记
+                    if (rvIsMine(sid, ch)) continue;         // v1.0.17: 自己撤回不记(按自身 userId 判定)
                     String body = rvTextFor(it);
                     if (body == null) continue;
                     rvRecord(mid, ch, body);
@@ -4375,10 +4867,11 @@ public class MainHook implements IXposedHookLoadPackage {
         rvLoad();
         if (ch == null || ch.length() == 0) return RV_MAP.size();
         int c = 0;
-        for (String v : RV_MAP.values()) {
+        for (java.util.Map.Entry<String, String> e : RV_MAP.entrySet()) {
+            String v = e.getValue();
             int sep = v.indexOf('\u0001');
             String chOf = (sep > 0) ? v.substring(0, sep) : "";
-            if (chOf.equals(ch)) c++;
+            if (chOf.equals(ch) || rvBelongsTo(ch, e.getKey())) c++;
         }
         return c;
     }
@@ -4896,6 +5389,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 String ch = rvCurrentChannel(act);
                 if (ch.length() > 0) {
                     rvNote(act.getClass().getSimpleName() + " 列表=" + curIds.size() + " 会话=" + ch);
+                    rvNoteIds(ch, curIds);                    // v1.0.15: 归属按 msgId 记账
                     try { rvListVanish(ch, cur, curIds); } catch (Throwable t) { flog("ANTIREVOKE", "源①异常: " + t); }
                     rvKickDbDiff(ch, curIds);
                 } else {
@@ -5075,15 +5569,20 @@ public class MainHook implements IXposedHookLoadPackage {
             android.widget.LinearLayout list = new android.widget.LinearLayout(act);
             list.setOrientation(android.widget.LinearLayout.VERTICAL);
             int n = 0;
-            java.util.ArrayList<String> rvVals = new java.util.ArrayList<String>();
-            synchronized (MainHook.class) { rvVals.addAll(RV_MAP.values()); }
-            for (String v : rvVals) {
+            java.util.ArrayList<String[]> rvVals = new java.util.ArrayList<String[]>();
+            synchronized (MainHook.class) {
+                for (java.util.Map.Entry<String, String> e : RV_MAP.entrySet())
+                    rvVals.add(new String[]{e.getKey(), e.getValue()});
+            }
+            for (String[] pair : rvVals) {
                 if (n >= 100) break;
+                String v = pair[1];
                 int sep = v.indexOf('\u0001');
                 String chOf = (sep > 0) ? v.substring(0, sep) : "";
                 String txtOf = (sep > 0) ? v.substring(sep + 1) : v;
                 if (curCh.length() == 0) break;                       // 会话未识别: 一条都不列
-                if (chOf.length() > 0 && !chOf.equals(curCh)) continue;   // 只列当前会话
+                // v1.0.15: 归属按 msgId 判定(库里两列约定不一致, 旧的纯 channel 比对会漏)
+                if (chOf.length() > 0 && !chOf.equals(curCh) && !rvBelongsTo(curCh, pair[0])) continue;
                 n++;
                 android.widget.TextView row = miText(act, txtOf, 12, 0xE6FFFFFF, false);
                 row.setPadding(0, (int) (6 * d), 0, (int) (6 * d));
@@ -6274,7 +6773,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         flog("INIT", "xorDecode DexKit兜底: hooked " + cm[0] + "#" + cm[1]);
                     } catch (Throwable t2) { }
                 }
-                if (n2 == 0) { flog("DEXKIT", "xorDecode 兜底 0 命中 → 丢缓存, 下轮重查"); dexCacheDrop("xor:p"); }
+                if (n2 == 0 && !dexQueryWasTransient()) { flog("DEXKIT", "xorDecode 兜底 0 命中 → 丢缓存, 下轮重查"); dexCacheDrop("xor:p"); }
                 flog("INIT", "xorDecode DexKit兜底: " + n2 + "处");
             } catch (Throwable t) { flog("INIT", "xorDecode DexKit兜底失败: " + t); }
         }
@@ -6285,7 +6784,7 @@ public class MainHook implements IXposedHookLoadPackage {
         Class<?> nf = null;
         String[] keyClassNames = {"i42.f", "n62.f"};
         for (String kcn : keyClassNames) {
-            try { nf = XposedHelpers.findClass(kcn, cl); flog("INIT", "hooked " + kcn + ".g/h"); break; } catch (Throwable t) { }
+            try { nf = XposedHelpers.findClass(kcn, cl); flog("INIT", "hooked " + kcn + ".g/h"); sEncodeKeyHooked = true; break; } catch (Throwable t) { }
         }
         if (nf != null) {
             XposedBridge.hookAllMethods(nf, "g", new XC_MethodHook() {
@@ -6331,7 +6830,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     });
                     flog("INIT", "DexKit兜底: hooked ENCODE_STATIC_KEY @ " + h);
                 }
-                if (hits.length == 0 && hits2.length == 0) {
+                if (hits.length > 0 || hits2.length > 0) sEncodeKeyHooked = true;
+                if (hits.length == 0 && hits2.length == 0 && !dexQueryWasTransient()) {
                     flog("DEXKIT", "密钥兜底 0 命中 → 丢缓存, 下轮重查");
                     dexCacheDrop("m:xorDecode(ENCODE_SIGN_KEY)");
                     dexCacheDrop("m:xorDecode(ENCODE_STATIC_KEY)");
@@ -6737,7 +7237,25 @@ public class MainHook implements IXposedHookLoadPackage {
         // ===== 乐迷团(事件驱动) =====
         installFansHideEventHook(cl);
 
-        // ===== 抽屉VIP挽回卡(侦察探针, v8.6) =====
+            // ===== UI 清理可见性拦截: 模块隐藏过的视图, 任何代码再设 VISIBLE 一律改写为 GONE =====
+            // (底栏控制器/抽屉 RN 会在重排时把隐藏的 tab/行重新设回 VISIBLE, GONE 拉锯必输;
+            //  在 setVisibility 入口改参数 = 确定性获胜, 零轮询)
+            try {
+                XposedBridge.hookAllMethods(android.view.View.class, "setVisibility", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        if (!prefDrawerClean && !prefBottomMidHide) return;
+                        if (param.args == null || param.args.length < 1) return;
+                        if (!(Integer.valueOf(android.view.View.VISIBLE)).equals(param.args[0])) return;
+                        if (sUiCleanHidden.contains(param.thisObject)) {
+                            param.args[0] = Integer.valueOf(android.view.View.GONE);
+                        }
+                    }
+                });
+                flog("INIT", "hooked View.setVisibility (UI清理视图保护)");
+            } catch (Throwable t) { flog("INIT", "setVisibility 保护 hook 失败: " + t); }
+
+            // ===== 抽屉VIP挽回卡(侦察探针, v8.6) =====
         try {
             Class<?> tvCls = XposedHelpers.findClass("android.widget.TextView", cl);
             XposedBridge.hookAllMethods(tvCls, "setText", new XC_MethodHook() {
@@ -6907,6 +7425,14 @@ public class MainHook implements IXposedHookLoadPackage {
                         flog("INIT", "DexKit L0健康检查: " + health
                             + (dexRb == null ? " [零搜索: 未建bridge]" : " [bridge 在]"));
                     } catch (Throwable t2) { flog("INIT", "DexKit L0异常: " + t2); }
+                    // v1.0.14: 先用已有缓存补装密钥 hook(不等搜索, 尽量赶在 App 启动期解密之前),
+                    //   新搜到的锚点在本块末尾再补一轮
+                    try {
+                        if (prefProtoCollect && !sEncodeKeyHooked) {
+                            int nk0 = hookEncodeKeysFromCache(clD);
+                            if (nk0 > 0) flog("DEXKIT", "L1 预补装密钥hook(缓存): " + nk0 + " 处");
+                        }
+                    } catch (Throwable t0a) { }
                     // v8.1: L1 按需构建 —— 新功能锚点(私信库 DAO / 首页块缓存宿主)缓存缺失时真搜一次
                     try {
                         if (dexCacheGet("m:private_chat_message_db") == null) {
@@ -6941,6 +7467,40 @@ public class MainHook implements IXposedHookLoadPackage {
                                 + (h2.length > 0 ? (" → " + h2[0]) : ""));
                         }
                     } catch (Throwable t6) { flog("DEXKIT", "L1 密钥锚点失败: " + t6); }
+                    // v1.0.13: 静态密钥锚点此前从未预热 → ENCODE_STATIC_KEY 永远采集不到(缓存里只有 SIGN 的 l42.f#g)
+                    try {
+                        if (prefProtoCollect && dexCacheGet("m:xorDecode(ENCODE_STATIC_KEY)") == null) {
+                            long t0 = System.currentTimeMillis();
+                            String[] h2b = dexkitFindMethodsByString(clD, "xorDecode(ENCODE_STATIC_KEY)");
+                            flog("DEXKIT", "L1 静态密钥锚点: " + h2b.length + " 处(" + (System.currentTimeMillis() - t0) + "ms)"
+                                + (h2b.length > 0 ? (" → " + h2b[0]) : ""));
+                        }
+                    } catch (Throwable t6b) { flog("DEXKIT", "L1 静态密钥锚点失败: " + t6b); }
+                    // v1.0.11: 后台补装密钥 hook —— 主线程安装期 Context 未就绪时(9.6.05 必现, 因硬编码 i42.f/n62.f 已失效)
+                    //   密钥采集会整轮缺失; 此处 Context 必就绪, 用缓存锚点补上
+                    try {
+                        if (prefProtoCollect && !sEncodeKeyHooked) {
+                            int nk = hookEncodeKeysFromCache(clD);
+                            flog("DEXKIT", "L1 补装密钥hook: " + nk + " 处" + (nk == 0 ? " (锚点未命中)" : " (主线程安装期 Context 未就绪, 后台补上)"));
+                        }
+                    } catch (Throwable t9) { flog("DEXKIT", "L1 补装密钥hook失败: " + t9); }
+                    // v1.0.9: 补齐另两个"无人值守"锚点的预热 —— xorDecode 解码器 / 广告渠道闸门
+                    try {
+                        if (prefProtoCollect && dexCacheGet("xor:p") == null) {
+                            long t0 = System.currentTimeMillis();
+                            String[] h3 = dexkitFindMethodsByStringNmuP(clD);
+                            flog("DEXKIT", "L1 解码器锚点(xor:p): " + h3.length + " 处(" + (System.currentTimeMillis() - t0) + "ms)"
+                                + (h3.length > 0 ? (" → " + h3[0]) : ""));
+                        }
+                    } catch (Throwable t7) { flog("DEXKIT", "L1 解码器锚点失败: " + t7); }
+                    try {
+                        if (prefAdBlock && dexCacheGet("m:Session.Account") == null) {
+                            long t0 = System.currentTimeMillis();
+                            String[] h4 = dexkitFindMethodsByString(clD, "Session.Account");
+                            flog("DEXKIT", "L1 闸门锚点(Session.Account): " + h4.length + " 处(" + (System.currentTimeMillis() - t0) + "ms)"
+                                + (h4.length > 0 ? (" → " + h4[0]) : ""));
+                        }
+                    } catch (Throwable t8) { flog("DEXKIT", "L1 闸门锚点失败: " + t8); }
                 }
             });
             t.setDaemon(true);

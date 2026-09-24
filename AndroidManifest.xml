@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="io.github.justsoso17.cmhook" android:versionCode="150" android:versionName="1.0.5">
+    package="io.github.justsoso17.cmhook" android:versionCode="186" android:versionName="1.0.6">
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="33"/>
     <application android:label="CM Hook" android:icon="@mipmap/ic_launcher" android:hasCode="true">
         <meta-data android:name="xposedmodule" android:value="true"/>
-        <meta-data android:name="xposeddescription" android:value="CloudMusic protocol/key hooks (recon) + home/podcast feed cleaner — target 9.5.96"/>
+        <meta-data android:name="xposeddescription" android:value="网易云UI修改模块"/>
         <meta-data android:name="xposedminversion" android:value="82"/>
         <meta-data android:name="xposedscope" android:value="com.netease.cloudmusic"/>
     </application>
