@@ -14,3 +14,4 @@ base*.apk
 libs/*.jar
 libs/dexkit_aar/
 libs/*.aar
+res-compiled.zip
