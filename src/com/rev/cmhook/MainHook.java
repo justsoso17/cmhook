@@ -4762,7 +4762,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 String uid = joStr(user, "userId");
                                 if ((sid2 == null || sid2.length() == 0) && uid != null) sid2 = uid;
                             }
-                            // v1.0.20: 图片 URL 提取 —— 9.6.05 实测(SQL_PROBE msgId=实机样例):
+                            // v1.0.20: 图片 URL 提取 —— 9.6.05 实测(SQL_PROBE 抓到真实图片消息样例):
                             //   msgBody.body 是"嵌套 JSON 字符串"(nimlib FileAttachment 序列化),
                             //   url/imageUrl 在 body 串里; 旧布局 msgBody.image 直挂的走下面兼容。
                             String bodyStr = joStr(mb, "body");
