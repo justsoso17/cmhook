@@ -18,32 +18,11 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
 public class MainHook implements IXposedHookLoadPackage {
-/**
- * CM Hook — 网易云音乐净化模块 (LSPosed, 单文件全量逻辑)
- * 目标: com.netease.cloudmusic 9.5.96 (versionCode 9005096), 兼容锚点漂移见各节注释
- *
- * 分区目录 (按方法名前缀可检索):
- *   [配置]   loadPrefs/savePref/setHudEnabled          — cmhook_prefs 读写, Application.attach 早载
- *   [日志]   flog/LSP_TAGS/trunc/rotateLogIfHuge       — 双通道: cm_hook.log(宿主私有, 全量) + LSPosed(仅INIT/SET镜像)
- *   [HUD]    hud/pushHud/renderHud/createHud/attachEntryChip/translatePath — 独白悬浮窗+设置入口芯片
- *   [面板]   showSettingsDialog/showProbeDialog/showTabsKeepDialog/mi* — Miuix 风格纯 View 弹窗
- *   [频道]   applyTopTabs/applyTabsCentering/filterHiddenTabs/reapplyLiveFilter/
- *            installFineDataFilter/resolveTabBaseViaDexkit/installTabGuard — 顶栏频道精细控制
- *   [乐迷团] installFansHideEventHook/hideFansGroupEntry/startFansHideWatcher/hideItemOf — 关注页透明化
- *   [卡片]   cardSweepTick/cardScan/replaceVipCard/isVipCardText — 抽屉VIP挽回卡替换为自定义图(方案A)
- *   [DexKit] dexBridge/dexkitFindMethodsByString/dexCacheGet/dexCachePut/dexHealthCheck/dexRebuildCache — 防漂移基建
- *   [去广告] 渠道闸门V()伪装 + LoadingAdManager.E + LoadingAdActivity + 网络层 ad/loading/* 清空 — 三层
- *   [清理]   isHomeFeedUrl/filterHomeFeed/emptyJsonArrayForKey/purgeHomeFeedCache/dumpFeed* — 首页/播客
- *   [防撤回] rv系列/notifyRevoke/hookRevokeHandlerMethod/dexkitFindRevokeHandlers — 三源台账+胶囊浮层
- *   [识曲]   startIdentify — 长按搜索区进识曲(PackageManager 枚举兜底)
- *   [入口]   handleLoadPackage/installBusinessHooks — hook 安装总装线(逐条 try/catch 独立)
- *   [反射]   fieldGet/invoke0/invoke1/callStr/callInt — 宿主类纯反射访问工具
- *
- * 纪律 (历史踩坑沉淀, 违反必翻车):
- *   1. 业务类在 DelegateLastClassLoader(Tinker系), hook 必须从 Activity 实例反拿真身加载器
- *   2. DexKit/搜索遍历严禁主线程 (曾 ANR); 高频路径 (getItem/getItemCount) 严禁写日志
- *   3. 新增 hook 一律 try/catch 独立安装, 失败不连坐
- *   4. 插入新代码用"安全锚点", v5/v6 区间曾有误删史
+/*
+ * 网易云净化模块 (LSPosed)。适配 9.6.05，兼容 9.5.96+。
+ * 改动历史与版本适配记录全在 kb/CHANGELOG，批注里不重复。
+ * 找代码: 按 "// ===== 分区 =====" 分段检索。
+ * 红线: 注释禁止真实账号/消息 id；主线程禁 DexKit；新 hook 独立 try/catch。
  */
 
     private static final String TARGET_PKG = "com.netease.cloudmusic";
@@ -230,10 +209,7 @@ public class MainHook implements IXposedHookLoadPackage {
             flog("SET", "配置载入 hud=" + prefHud + " hudTranslate=" + prefHudTranslate + " adblock=" + prefAdBlock + " antirevoke=" + prefAntiRevoke
                 + " homeClean=" + prefHomeClean + " podcastClean=" + prefPodcastClean + " protoCollect=" + prefProtoCollect
                 + "");
-            // v19: 丢掉旧的本地 feed 缓存(否则秒开渲染会用未过滤副本)
-            // v7.6/v7.7: 开关打开 = ① 切换那一刻立刻清 ② 之后每次冷启动都做一次"智能清"
-            //   智能 = 只删含未过滤锚点(PAGE_RECOMMEND_SHORTCUT / home_recent_play_module / 最近常听)的缓存,
-            //   已是过滤版的保留 —— 既不漏旧副本, 也不白白丢掉好缓存
+            // 开关打开瞬间 + 每次冷启动各清一次: 只删含未过滤锚点的缓存副本, 已过滤的保留
             if (prefHomeClean) {
                 final boolean firstTime = !sp.getBoolean("home_clean_purged", false);
                 try {
@@ -640,10 +616,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // 子树里是否有 contentDescription 精确命中 texts(限深 8)
     // (9.6.x 底栏/部分 RN 节点的可见标签只登记在无障碍描述里, 文本为空)
-    // v1.0.21: 播放条上方"免费听时长已耗尽/畅听免费续"粘性推广条(实测 9.6.05: adStickContainer/bgContainer
-    //   内 titleTV+actionTV, 1440x182 悬浮于播放条上方; 内容为实时接口下发, MMKV 无缓存 → 走 UI 层)
-    //   锚点 = 文本命中 STICKY_BANNER_TEXTS 的叶子 TextView; 爬到最外层"条状"祖先(高≤300 且宽≥60%屏)
-    //   GONE + 进 sUiCleanHidden 保护集(宿主再设 VISIBLE 会被 setVisibility hook 压回 GONE)
+    // 粘性横幅: 锚点=文本命中 STICKY_BANNER_TEXTS 的叶子 TextView, 爬最外层条状祖先(高≤64dp 且宽≥60%屏)
+    // GONE + 进 sUiCleanHidden 保护集(宿主再设 VISIBLE 会被压回)
     private static final String[] STICKY_BANNER_TEXTS = {"免费听时长", "畅听免费"};
 
     private static int hideStickyBanner(android.view.View v, int sh, int sw) {
@@ -798,10 +772,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // 抽屉菜单数组精确清除: 只清空"内容含 side_bar_new_first 的 dataGroupResourceList 数组",
-    // 同响应里其他配置数组(如设置页菜单)原样保留; 无可清数组返回 null
-    // 逐条目清理: 遍历每个 dataGroupResourceList 数组的顶层条目, 只移除含 side_bar_new_first
-    // 的条目(侧栏菜单项), 同数组/同响应里其他页面的条目原样保留; 无可清条目返回 null
+    // 只清内容含 side_bar_new_first 的数组/条目, 同响应里其他页面配置(设置页菜单等)一律保留
     private static String clearDrawerArrays(String json) {
         String result = json;
         int cleared = 0;
@@ -982,12 +953,8 @@ public class MainHook implements IXposedHookLoadPackage {
         return best;
     }
 
-    // ===== v15: 标题栏剩余频道居中 — 改用分叉原生 GRAVITY_CENTER 机制 =====
-    // 网易的 MusicTabLayout 保留了 Material 的 tabGravity 字段与 applyModeAndGravity():
-    //   SCROLLABLE 模式下 tabGravity=1(CENTER) → strip gravity 置 CENTER, tab 整组居中;
-    //   onMeasure 里 tabGravity=1 且 tab 放不下(iMax*N > 宽-32dp)时原生自动回落 START+滚动。
-    // v14.x 的 wrap_content/清margin/padding 自研方案与该 onMeasure 分发互相打架,
-    // 是"切换频道瞬间频道栏闪一下"的根因, 全部移除。
+    // ===== 频道居中: 用原生 tabGravity=CENTER(applyModeAndGravity), 放不下自动回落滚动 =====
+    // 自研 padding/清 margin 方案会与 onMeasure 打架(切频道闪屏), 已废弃
     private static final java.util.Map<android.view.View, Boolean> tabsCenterTracked =
         java.util.Collections.synchronizedMap(new java.util.WeakHashMap<android.view.View, Boolean>());
     private static final android.view.View.OnLayoutChangeListener TABS_RELAYOUT =
@@ -1014,11 +981,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile int lastVisCount = -1;
     private static volatile int stateLogCount = 0;
 
-    // ===== v21: DexKit 缓存 (免每次冷启动全量搜查) =====
-    // 两层缓存:
-    //   ① 结果级(决定性): 解析结果(类名/方法签名)存 prefs `cmhook_dex`, 命中即跳过 DexKit 调用 —— 冷启动"零搜查"
-    //   ② 库级: DexKitCacheBridge 结果缓存落盘 + 单例 RecyclableBridge(域内复用, idle 自动回收)
-    // 缓存域 = 模块逻辑版本 + 目标APP versionCode → APP 升级/模块改锚点即自动换域重查(旧域 key 顺手清理)
+    // ===== DexKit 两层缓存: 结果级 prefs(命中即零搜查) + 库级 bridge; 域=模块版本+APP versionCode =====
     private static final String DEXKIT_CACHE_VER = "v23";
     private static final String DEXKIT_PREFS = "cmhook_dex";
     private static volatile android.content.Context dexHostCtx = null;   // Application.attach 时抓到的宿主 Context
@@ -1617,13 +1580,9 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ===== 频道源头上过滤: 在数据喂给 适配器(页)/TabLayout(标签) 之前就把隐藏频道删掉 =====
-    // 咽喉点: ArkFragment.refreshAdapterData(List<HomeTopTabInfo>) — 服务端/缓存频道列表的唯一入口
-    //          xo.a.s0(List<HomeTopTabInfo>) — 翻页适配器的数据设置器(兜底)
-    // 页面从一开始就不创建, 无需任何滑动拦截
-    // ⚠️ 不能用全局flag去重: installBusinessHooks先跑死副本加载器再跑真身加载器,
-    //    flag会把真身上的安装跳过, hook落在死副本上永远不触发(DelegateLastClassLoader陷阱);
-    //    去重交给 installBusinessHooks 的 doneLoaders(按加载器实例区分)
+    // ===== 频道源头过滤: 数据喂给适配器/TabLayout 之前就剔除隐藏频道, 页面不创建, 无需滑动拦截 =====
+    // 咽喉: ArkFragment.refreshAdapterData(List) — 频道列表唯一入口
+    // ⚠️ 不能用全局 flag 去重: 会把真身加载器上的安装跳过(hook 落在死副本), 去重交给 doneLoaders
     private static volatile int filterDbgCount = 0;
     private static volatile int feedLogCount = 0;   // v11: 咽喉feed留痕限频(每进程前20次)
 
@@ -1759,15 +1718,9 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { }
     }
 
-    // ===== 频道源头过滤 v11: 三层解析(硬编码→反射→DexKit) + 统一数据咽喉 hook =====
-    // 核心结论(v9实证): 首页顶栏数据咽喉是 适配器基类里 listTabs.clear()+addAll(data)+notifyDataSetChanged 的
-    //   public void xxx(List) 方法 — 9.5.70 为 et.h.B0/et.e.z0, 9.5.96 混淆漂移为 dr.h.P0/dr.e.M0(结构不变)。
-    //   在数据进咽喉前剔除隐藏频道 → listTabs 从加载那一刻起就不含隐藏频道:
-    //   页面不创建(createFragment按position索引)、getLength()计数不含、左右滑动滑不进隐藏频道页。
-    // v10/v11 防混淆: 硬编码名字在 APP 更新后会失效, 补兜底 —
-    //   ① 硬编码快路径(9.5.96: dr.h/dr.e; 旧名et.h/et.e保留, loadClass失败即跳过)
-    //   ② 反射: 从稳定宿主Fragment类(完整类名不受混淆)字段类型反推适配器基类, 无名字依赖
-    //   ③ DexKit 2.2.0: 按字符串特征("RecommendTwoFlowAdapter"/"DiscoveryFragmentAdapter")全量搜索
+    // ===== 频道过滤三层解析: 硬编码 → 反射(字段类型反推适配器基类) → DexKit(特征串搜索) =====
+    // 咽喉 = 适配器基类 listTabs.clear()+addAll(data)+notify 的 public void xxx(List);
+    // 进咽喉前剔除 → 页面不创建、计数不含、滑不进隐藏页。9.5.70=et.h.B0/et.e.z0, 9.5.96+=dr.h.P0/dr.e.M0
     private static void installFineDataFilter(ClassLoader cl) {
         int n = 0;
         // ① 硬编码快路径
@@ -2214,11 +2167,7 @@ public class MainHook implements IXposedHookLoadPackage {
         } }, 400);
     }
 
-    // ===== 首页推荐精细控制对话框 (v1.0.14) =====
-    // 屏蔽制(勾选=隐藏); 数据=发现式累积(实时响应+落盘); 双层: 顶部卡片级 + 内容块级。
-    // 保底联动: 卡片全隐藏→整行自动移除(卡组开关全部关闭时提示)。
-    // v1.0.14: 隐藏集指纹变更→防抖强刷首页缓存(勾选从关到开即时生效, 不再等旧 MMKV 副本);
-    //          互斥置灰: 总开关关→全部子项灰, 整行隐藏开→单卡勾选灰。
+    // ===== 首页精细控制对话框: 屏蔽制(勾选=隐藏), 发现式累积; 卡全隐藏→整行移除; 指纹防抖强刷缓存 =====
     private static void showHomeFineDialog(final android.app.Activity act) {
         try {
             float d = miDens(act);
@@ -3364,11 +3313,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
 
-    // ===== App探测清单 (数据源: 网易云 ad#appSnifferList 官方映射) =====
-    // ===== v51: 探测名单"同源跟随" =====
-    // 官方名单在宿主 MMKV 配置里(明文 JSON): files/mmkv/com.netease.cloudmusic.core.customconfig.MMKV_CUSTOM_CONFIG
-    //   "appSnifferList":[{"scheme":"taobao","pkgName":"com.taobao.taobao"}, ...]
-    // 该配置由云端下发覆盖 ⇒ 读它 = 与官方同步(含新增/删除探测项); 本地 PROBE_APPS 仅作中文名表与兜底
+    // ===== App 探测清单: 名单读宿主 MMKV customconfig 的 appSnifferList(云端下发=同源), 本地表只补中文名 =====
     private static volatile String[] probeOfficial = null;   // 形如 "scheme|pkg|官方"
 
     private static String[] probeOfficialList() {
@@ -3808,12 +3753,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // LSPosed 日志白名单: 只镜像 装载确认(INIT) + 用户操作(SET)。其余(过滤明细/HTTP/CMENC/serialdata/
-    // 探针/页面事件等)只进 cm_hook.log(宿主私有目录) —— LSPosed 缓冲区保持干净(09-21 用户要求"减少到最少")。
-    // 模块崩溃类错误由 LSPosed 自身记录(如 Failed to load class), 不依赖镜像。
-    // v1.0.21-fix3: LSPosed 镜像收紧为"仅装载存活信号" —— 常规日志(含 SET 明细/INIT 全量)一律只进 cm_hook.log。
-    //   LSPosed 每进程只会有 2~3 行(handleLoadPackage / 业务hook安装完成); 排障用 su 读文件日志。
-    //   LSP_TAGS 机制保留(紧急时把标签加回来即可镜像)。
+    // LSPosed 日志只留存活信号(lspOnce, 每进程2行), 其余全进 cm_hook.log; LSP_TAGS 机制保留应急
     private static final java.util.HashSet<String> LSP_TAGS = new java.util.HashSet<String>();
 
     // 一次性 LSPosed 存活信号: 按 key 去重, 每进程每 key 至多一行
@@ -3991,11 +3931,8 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { }
     }
 
-    // ===== v1.0.14: 开关→缓存联动 =====
-    // 精细控制页所有隐藏项(总开关/整行/卡/块)统一走指纹: 变了才刷, 1.2s 防抖
-    // (连续勾选只刷一次; 必须 force —— "取消勾选"方向的脏缓存(内容缺失)无法用锚点探测)
-    // 注意: Handler 不能做成 static final 字段 —— <clinit> 在主 Looper prepare 之前跑,
-    //       getMainLooper()=null 会 NPE 炸掉整个模块类加载(v1.0.14 首版踩过)
+    // ===== 开关→缓存联动: 隐藏项统一走指纹防抖(1.2s), 取消勾选方向的脏缓存必须 force 刷 =====
+    // ⚠️ Handler 不能 static final: <clinit> 早于主 Looper, getMainLooper()=null 会 NPE 炸类加载
     private static Runnable sHomePurgePending;
 
     private static String homePrefsFp() {
@@ -4048,10 +3985,7 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { }
     }
 
-    // ===== v31: 关注页「乐迷团」项隐藏 =====
-    // 关注页(底部导航中间) → 顶部「关注」tab 的第一条横滑项 = 乐迷团
-    // 该页为 RN 渲染成原生 View(容器 id=rn_content / DC_NativeList), 文案来自本地资源(String#2388)
-    // 手法: 按文本定位 TextView → 上溯到"该项容器"(宽度 < 屏宽60%) → GONE; RN 重渲染会覆盖 → 多次延时重试
+    // ===== 乐迷团隐藏: RN 渲染(文案来自资源串), 按文本定位容器 GONE, RN 重渲染需多次延时重试 =====
     private static android.view.View findByTextEquals(android.view.View v, String text, int depth) {
         if (v == null || depth > 200) return null;
         try {
@@ -4096,10 +4030,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final java.util.HashMap<String, java.util.LinkedHashMap<String, String>> RV_DBSEEN =
             new java.util.HashMap<String, java.util.LinkedHashMap<String, String>>();
 
-    // v1.0.15: 会话 → 本会话已见 msgId 集合。**台账归属改按 msgId 判定**:
-    //   库里的 (userId, channelId) 两列约定在不同会话间不一致(实测有的会话存 userId=我/channelId=对方,
-    //   有的会话反过来存 userId=对方/channelId=我) → 同一会话的历史台账会被分到两个 channel 桶里,
-    //   聊天页按当前 channel 查就恒为 0(胶囊空)。只要消息出现在本会话的列表/库读结果里, 即算本会话。
+    // 台账归属按 msgId: 库里两列约定不一致, 按 channel 分桶会错位 — 出现在本会话列表/库读里即算本会话
     private static final java.util.HashMap<String, java.util.LinkedHashSet<String>> RV_IDS =
             new java.util.HashMap<String, java.util.LinkedHashSet<String>>();
 
@@ -4126,11 +4057,8 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ===== v1.0.17: "自己 vs 对方"判据重做 =====
-    //   旧判据 `senderId == 会话id 即对方` 在 9.6.x 失效 —— 模块拿到的会话 id 有时是对方、
-    //   有时被解析成我自己, 于是"我自己发的"被当成对方的消息记进台账(实测误记过一条本人消息)。
-    //   改为跟**自身 userId** 比; 自身 userId 从库里推定: 每一行不管哪一列写的是我, 我的 id 都会出现一次
-    //   (801/801), 对方 id 只出现在自己那几行 → 两列合并计数取最大者即"我"。
+    // ===== "自己 vs 对方"判据: 跟自身 userId 比(从库两列计数推定) =====
+    // 旧判据 senderId==会话id 会把我发的记成对方撤回(会话 id 时对时错)
     private static volatile String rvMyId = null;
     // v1.0.20-fix: 自身 uid 以"登录态"为最高优先 —— 每用户 MMKV 文件名里带 uid, 取最近被写的那个账号。
     //   库里"两列合并计数"推定降级为兜底: 换账号登录后库的数值分布不变(该会话两列恒为 对方id/自己id, 恰好对换号免疫),
@@ -4454,12 +4382,8 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    // ===== v7.0 治本: 私信库 DAO 解析 =====
-    //  9.5.96 实测(classes11/classes8):
-    //    私信 DAO = j30.a  表 private_chat_message_db  private w(IMChat,int status,int limit,boolean desc):List
-    //    圈聊 DAO = l51.a  表 circle_chat_message_db    (同源: extends x41.a, implements x41.c)
-    //  旧硬编码 x50.a 在 9.5.96 已被 R8 复用成广告点击监听器 → NoSuchFieldException: b → 台账恒空 → 胶囊不显示
-    //  解析链: ① 硬编码(表名 getter 校验) ② DexKit 按表名串反查类 ③ 失败即打日志, 不静默
+    // ===== 私信库 DAO 解析: 硬编码(表名校验) → DexKit 表名反查, 失败打日志不静默 =====
+    // 私信 DAO = j30.a(9.6.05 上 l30.a 才对) 表 private_chat_message_db; 圈聊 = l51.a; 旧 x50.a 已被 R8 复用, 硬编码必炸
     private static volatile Class<?> rvDaoCls = null;
     private static volatile Object rvDaoObj = null;
     private static volatile java.lang.reflect.Method rvDaoW = null;
@@ -4655,10 +4579,7 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    // 读库: j30.a#w(IMChat, status=0, limit=1000, desc=true)   status 0 = 本地库正常消息行(实机库核对)
-    // v1.0.15: 宿主 DAO 路径优先, 但它"成功返回 0 条"时必须直连 SQLite 兜底
-    //   (9.6.05 实测: l30.a#w 的 SQL 是 `userId=? AND channelId=? AND status=?`, 而模块自建/陈旧 DAO 实例的
-    //    userId 与库里的不一致 → 恒 0 条 → ②库窗口/③库条目 两条记账源全灭 → 胶囊恒空)
+    // 读库: DAO#w(IMChat,0,1000,true); 它"成功返回0条"时直连 SQLite 兜底(实例 userId 与库不一致会恒 0 条)
     private static java.util.List<?> rvQueryDb(String channelId) {
         if (channelId == null || channelId.length() == 0) return null;
         // v1.0.18: 直连 SQL 优先 —— 它是"按会话完整取行", 而宿主 DAO 的 userId 过滤会给出不稳定子集;
@@ -4929,11 +4850,8 @@ public class MainHook implements IXposedHookLoadPackage {
         public String getNickname() { return nick; }
     }
 
-    // ===== v1.0.20: 撤回图片留存 =====
-    //   图片消息(msgType=1, msgBody.image.url)只在"消息还活着"时可取 —— 三源记账都会先走 rvTextFor,
-    //   那是唯一的留存时机: 提取 URL → 后台线程下载到宿主私有 files/cmhook_rv/<msgId>.img。
-    //   撤回只删库行/列表项, 追不回已删的图; 留存成功与否与文本记账互不影响。
-    //   图片路径不入 cmhook_revoke.txt(保持"msgId | ch | 文本"格式), 另存映射文件按 msgId 关联。
+    // ===== 撤回图片留存: 图片只在消息活着时可取, 三源都先走 rvTextFor → 在那里提取 URL/缓存并落盘 =====
+    // 落盘 files/cmhook_rv/<msgId>.img, 路径另存映射文件; 留存失败不影响文本记账
     private static final String RV_IMG_DIR = "/data/data/" + TARGET_PKG + "/files/cmhook_rv";
     private static final String RV_IMG_FILE = "/data/data/" + TARGET_PKG + "/files/cmhook_revoke_img.txt";
     private static final java.util.HashMap<String, String> RV_IMG = new java.util.HashMap<String, String>();   // msgId → 本地路径
@@ -5158,10 +5076,7 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { flog("ANTIREVOKE", "看图失败: " + t); }
     }
 
-    // ===== v1.0.20: 长按图片 → 保存到 Download =====
-    //   全屏看图与浮层缩略图都挂长按; 弹 Miuix 风单按钮小窗(点外部/返回键关闭)。
-    //   保存: Android 10+ 走 MediaStore.Downloads(相对路径 Download/, 无需权限);
-    //   低版本直写公共 Download(无权限时退应用外部私有目录) —— 结果一律 Toast 带实际路径。
+    // 长按保存: Android 10+ 走 MediaStore.Downloads, 低版本直写/退私有目录; Toast 带实际路径
     private static android.widget.PopupWindow rvSavePopup = null;
 
     private static void rvDismissSavePopup() {
@@ -5290,11 +5205,7 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { return null; }
     }
 
-    // ===== v7.0 三源台账 =====
-    //  ① 列表消失: 进过列表的 msgId 后来不见了 = 被撤回(会话开着时立即命中, 不依赖库)
-    //  ② 库窗口缺失: 库里有、列表没有 —— 只认"列表已加载时间跨度内"的行(0..最旧命中下标, 库 DESC),
-    //     避免把没翻到的历史消息全判成撤回
-    //  ③ 库条目消失: 上轮库里有、这轮库里没了 = 被撤回(覆盖"不在聊天页时被撤")
+    // ===== 三源台账: ① 列表消失(即时) ② 库窗口缺失(只认列表已加载跨度, 防误判) ③ 库条目消失(覆盖不在聊天页时) =====
     private static int rvListVanish(String ch, java.util.List<?> cur, java.util.HashSet<String> curIds) {
         java.util.LinkedHashMap<String, String> seen;
         synchronized (RV_SEEN) {
@@ -5529,12 +5440,7 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    // ===== 抽屉VIP挽回卡(方案A: 视图层替换, v8.6) =====
-    // 卡片 = 服务端资源位(positionId=118「账号页卡板」, mod_vip, 按过期VIP人群投放, 第二行内容轮换)。
-    // 文本在模块 hook 装好前已绑定(setText 探针抓不到) → 用巡检器驱动主动扫描: 全窗口找标题 TextView →
-    // 上溯锁定卡片容器(高 11%~25% 屏高 且 宽≥40% 屏宽) → 原卡 GONE + 同位插入自定义 View。
-    // 自定义图片: /sdcard/Android/data/com.netease.cloudmusic/files/cmhook_drawer_card.png
-    // (支持 png/jpg/webp; 无图时显示模块占位卡)。
+    // ===== 抽屉VIP卡替换: 文案在 hook 前已绑定 → 巡检器主动扫描定位容器, 原卡 GONE + 插自定义图 =====
     private static final Object CARD_LOCK = new Object();
     private static final int CARD_PICK_REQ = 0x434D;           // 相册选图 requestCode ('CM')
     private static volatile boolean cardReplaced = false;      // 本次进程已替换(替换后停止扫描)
@@ -6438,12 +6344,7 @@ public class MainHook implements IXposedHookLoadPackage {
         return s.substring(a, b);
     }
 
-    // ===== v1.0.13: 首页推荐精细控制(发现式双层: 块级 + 顶部卡片级) =====
-    // 结构: data.blocks[] 每块含 positionCode; 顶部块 PAGE_RECOMMEND_DAILY_RECOMMEND 内
-    // dslData.blockResource.resources[] = 顶部可滑动卡片行实例(每卡含 subTitle/resourceType/title)。
-    // 发现式: 每次响应实时提取 positionCode 与卡片清单, 累积持久化(按账号无关的语义身份);
-    // 改写按用户勾选的隐藏集手术。保底: 结构校验门 / 空页放弃 / 卡片全隐藏转整行移除 /
-    // 未知默认显示 / 截断守卫沿用外层 / 总闸 home_clean。
+    // ===== 首页精细控制: 双层(顶部卡片行 + 内容块), 发现式累积, 按勾选隐藏集手术, 保底沿用外层 =====
     private static final String DAILY_CODE = "PAGE_RECOMMEND_DAILY_RECOMMEND";
 
     private static final java.util.HashMap<String, String> HOME_BLOCK_NAMES = new java.util.HashMap<String, String>();
@@ -6641,10 +6542,7 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    // 块级显示名: 结构化解析 dslData —— ③ 模块对象 "blockTitle"(头部, 如「鬼卞发行新歌」) ②
-    // 模块直属 "title" / blockResource.title / blockResourceVO.title(如「排行榜」「推荐歌单」「xx的雷达歌单」)。
-    // resources[] 里的 title 是卡片/tab 名(安分守己/摇滚榜), 刻意不取。
-    // org.json 是框架类运行时必有, 但编译用 android.jar 是裁剪版 → 反射调用; 解析失败退化到首个 "title"
+    // 块名优先级: blockTitle > 模块直属 title 系 > 首个 title; 卡片 title 刻意不取; org.json 反射调用(裁剪版 jar)
     private static volatile boolean sTitleDbg = false;
     private static volatile boolean sUiCleanChainLogged = false;
 
@@ -7565,13 +7463,8 @@ public class MainHook implements IXposedHookLoadPackage {
             flog("INIT", "hooked NeteaseMusicUtils serial*");
         } catch (Throwable t) { flog("INIT", "NeteaseMusicUtils 失败: " + t); }
 
-        // ===== 项目1: 去开屏广告 =====
-        // ① 渠道闸门伪装(v8.4): jk.a.V() = b2.g("google") = 官方"GP渠道无广告"总闸(9.5.70=km.a)。
-        //    强制 true 后 App 走 nogetad/needFilterAd 分支, 开屏广告请求根本不发, 预取同样被掐,
-        //    冷启广告等待 2000ms→300ms。全 App 6 处调用点均在广告链路, 无其它副作用。
-        //    定位链: 硬编码 jk.a(形状校验) → DexKit 按类体特征串 "Session.Account" 反查会话管理器类。
-        //    注: VIP 客户端标志 E()=isBlackVip 只控黑胶启动图不控广告; 服务端按真实账号 vipType
-        //    决定下发(SVIP 照样下发, 实证), 伪装 VIP 无效 —— 渠道闸门才是客户端唯一总闸。
+        // ===== 去开屏广告: ① 渠道闸门伪装(jk.a.V() 是"GP渠道无广告"总闸, 强制 true 后请求根本不发) =====
+        // 定位: 硬编码 → DexKit 按 "Session.Account" 反查; 伪装 VIP 无效(服务端按真实 vipType 下发)
         try {
             Class<?> gateCls = null;
             try {
@@ -7719,11 +7612,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 }
                             } catch (Throwable t4) { flog("PODCAST_CLEAN", "<err " + t4 + ">"); }
                         }
-                        // v1.0.5: 抽屉侧栏菜单源头清理 — link/position/show/resource 的
-                        // positionCode=side_bar_new_first 响应里, dataGroupResourceList 就是
-                        // 「我的消息→我的客服」整段菜单(服务端下发)。清空后抽屉原生不渲染。
-                        // 注意: 同端点也下发其他页面的配置(如设置页), 只清"数组内容含
-                        // side_bar_new_first 的那些数组", 其他数组一律保留(否则误清设置页菜单)。
+                        // 只清含 side_bar_new_first 的数组, 其他(设置页配置)一律保留, 否则误清设置页菜单
                         if (prefDrawerClean && url2 != null && url2.indexOf("link/position/show/resource") >= 0
                                 && text != null && text.indexOf("side_bar_new_first") >= 0) {
                             try {
@@ -7735,10 +7624,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 }
                             } catch (Throwable t5) { flog("DRAWER", "<err " + t5 + ">"); }
                         }
-                        // v8.2: 开屏广告网络层拦截 — 9.5.96 开屏广告走 /eapi|xeapi/ad/loading/get(展示)
-                        // 与 /ad/loading/bidget(预取) 两个端点, 且素材预取完成时 LoadingAdManager.E
-                        // 根本不被调用(老 hook 零命中)。把顶层 ads[] 清成 [] = 服务端自己的"无广告"
-                        // 合法形态, App 直接跳主页面。前缀匹配 ad/loading/ 同时覆盖两个端点。
+                        // 顶层 ads[] 清成 [] = 服务端合法无广告形态; 预取命中时老 hook 零命中, 网络层才是承重墙
                         if (prefAdBlock && url2 != null && url2.indexOf("ad/loading/") >= 0) {
                             try {
                                 if (text != null && text.length() > 0) {
@@ -8056,18 +7942,9 @@ public class MainHook implements IXposedHookLoadPackage {
             flog("INIT", "SQL 探针已装(SQLiteDatabase delete/update)");
         } catch (Throwable t) { flog("INIT", "SQL 探针失败: " + t); }
 
-        // 撤回命令处理类 nimlib biz.c.i.m: a(v)=单条推送, b(ab)=批量推送 → 内部 MsgDBHelper.deleteMessage 删本地库再广播
-        //   d(w)=自己撤回的服务器响应 → 不拦(保本机撤回); biz.c.i.o=会话列表同步(混正常更新) → 不拦
-        // DexKit兜底锚点: 撤回处理方法必调用 MsgDBHelper.saveRevokeMessage(String) —
-        //   按 invoke 反查(类名+方法名+参数), 天然排除 d(w)(参数是基类biz.e.a)与ack辅助a(ab)(不调save)
+        // 拦 a(v)/b(ab)=对方撤回推送; d(w)=本机撤回不拦; DexKit 按 invoke saveRevokeMessage 反查兜底
 
-        // v10: DexKit 自检(后台线程, 不阻塞): 用运行时加载器(cl, 含Tinker patch)验证
-        //   libdexkit.so 可加载 + 字符串特征查询可命中 patch 层类。快路径正常时不参与过滤,
-        //   但通路必须提前验明, 否则下次APP升级混淆改名时才会暴露问题。
-        // v22 分档:
-        //   L0 健康检查(每次冷启动, 只校验缓存有效性 —— 不搜 dex、不建桥)
-        //   L1 缓存构建(域变化/缓存缺失时, 由业务侧兜底或重建入口真搜一次并落缓存)
-        //   L2 深度重建(设置面板「重建 DexKit 缓存」手动触发)
+        // DexKit 三档: L0 健康检查(不搜dex) / L1 域变化真搜 / L2 面板手动重建; 通路要提前验, 否则升级改名才暴露
         try {
             final ClassLoader clD = cl;
             Thread t = new Thread(new Runnable() {
