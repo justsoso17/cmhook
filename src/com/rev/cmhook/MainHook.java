@@ -80,6 +80,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean prefIdentifyLongPress = true;
     private static volatile boolean prefDrawerClean = false;     // 抽屉侧栏菜单精简(隐藏 我的消息→我的客服)
     private static volatile boolean prefBottomMidHide = false;   // 底栏中间入口(笔记/关注)隐藏
+    private static volatile boolean prefStickyBannerHide = true; // v1.0.21: 播放条上方"免费听时长"粘性推广条隐藏
     private static final java.util.ArrayList<android.view.View> sUiCleanHidden = new java.util.ArrayList<android.view.View>(); // 已隐藏的视图(开关关闭时恢复)
     private static volatile long sLastUiScanSchedule = 0;
     private static volatile String sTopActivity = "";   // onResume 跟踪(仅主界面做底栏/骨架清理)
@@ -175,6 +176,7 @@ public class MainHook implements IXposedHookLoadPackage {
             prefIdentifyLongPress = sp.getBoolean("identify_longpress", true);
             prefDrawerClean = sp.getBoolean("drawer_clean", false);
             prefBottomMidHide = sp.getBoolean("bottom_mid_hide", false);
+            prefStickyBannerHide = sp.getBoolean("stick_banner_hide", true);
             if (prefDrawerClean) {
                 // 抽屉菜单精简: 清除 H5 侧栏配置缓存 —— 抽屉是缓存优先渲染,
                 // 不清缓存的话会一直显示旧菜单 + 分组骨架条(白条也是配置里的 item)
@@ -483,6 +485,13 @@ public class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
+    // v1.0.21: 包含式匹配(横幅标题"免费听时长已耗尽"等长文案, 精确匹配不命中)
+    private static boolean textContainsAny(CharSequence t, String[] list) {
+        if (t == null || t.length() == 0) return false;
+        for (String s : list) if (t.toString().contains(s)) return true;
+        return false;
+    }
+
     private static void scheduleUiCleanScan() {
         if (!prefDrawerClean && !prefBottomMidHide) return;
         long now = System.currentTimeMillis();
@@ -497,7 +506,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static void scanUiClean() {
         try {
-            if (!(prefDrawerClean || prefBottomMidHide)) return;
+            if (!(prefDrawerClean || prefBottomMidHide || prefStickyBannerHide)) return;
             int hid = 0;
             java.util.List<android.view.View> roots = allWindowRoots();
             int sh = android.content.res.Resources.getSystem().getDisplayMetrics().heightPixels;
@@ -545,6 +554,9 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                     hid += k;
                 }
+                if (prefStickyBannerHide) {
+                    hid += hideStickyBanner(root, sh, sw);
+                }
             }
             if (hid > 0) flog("SET", "界面清理: 本次隐藏 " + hid + " 个视图");
         } catch (Throwable t) { }
@@ -589,6 +601,9 @@ public class MainHook implements IXposedHookLoadPackage {
                             collapseView(c);
                             if (!sUiCleanHidden.contains(c)) sUiCleanHidden.add(c);
                             n++;
+                            // v1.0.21-fix2: 明细日志(定位跨账号底栏结构差异误伤)
+                            flog("SET", "底栏隐藏[语义]: 子项" + i + " <" + c.getClass().getSimpleName()
+                                    + " id=" + rvIdNameSafe(c) + " " + c.getWidth() + "x" + c.getHeight() + ">");
                             if (!sUiCleanChainLogged) {
                                 sUiCleanChainLogged = true;
                                 logUiChain(g);
@@ -607,6 +622,8 @@ public class MainHook implements IXposedHookLoadPackage {
                         collapseView(mid);
                         if (!sUiCleanHidden.contains(mid)) sUiCleanHidden.add(mid);
                         n++;
+                        flog("SET", "底栏隐藏[结构]: 子项1 <" + mid.getClass().getSimpleName()
+                                + " id=" + rvIdNameSafe(mid) + " " + mid.getWidth() + "x" + mid.getHeight() + ">");
                         if (!sUiCleanChainLogged) {
                             sUiCleanChainLogged = true;
                             logUiChain(g);
@@ -623,6 +640,74 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // 子树里是否有 contentDescription 精确命中 texts(限深 8)
     // (9.6.x 底栏/部分 RN 节点的可见标签只登记在无障碍描述里, 文本为空)
+    // v1.0.21: 播放条上方"免费听时长已耗尽/畅听免费续"粘性推广条(实测 9.6.05: adStickContainer/bgContainer
+    //   内 titleTV+actionTV, 1440x182 悬浮于播放条上方; 内容为实时接口下发, MMKV 无缓存 → 走 UI 层)
+    //   锚点 = 文本命中 STICKY_BANNER_TEXTS 的叶子 TextView; 爬到最外层"条状"祖先(高≤300 且宽≥60%屏)
+    //   GONE + 进 sUiCleanHidden 保护集(宿主再设 VISIBLE 会被 setVisibility hook 压回 GONE)
+    private static final String[] STICKY_BANNER_TEXTS = {"免费听时长", "畅听免费"};
+
+    private static int hideStickyBanner(android.view.View v, int sh, int sw) {
+        int n = 0;
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) n += hideStickyBanner(g.getChildAt(i), sh, sw);
+            return n;
+        }
+        if (v instanceof android.widget.TextView) {
+            CharSequence cs = ((android.widget.TextView) v).getText();
+            if (cs == null || !textContainsAny(cs, STICKY_BANNER_TEXTS)) return 0;
+            // v1.0.21-fix: 爬容器上限改 dp 判据(横幅 ~52dp; 播放条 minPlayerBar ~79dp 也 ≤300px,
+            //   vc195 的 300px 上限把播放条整个 GONE 掉了 —— 像素阈值跨机不可靠, kb 有前科)
+            int maxH = (int) (64 * android.content.res.Resources.getSystem().getDisplayMetrics().density);
+            android.view.View best = v;
+            android.view.View cur = v;
+            android.view.ViewParent p = cur.getParent();
+            while (p instanceof android.view.View) {
+                android.view.View pv = (android.view.View) p;
+                int w = pv.getWidth(), h = pv.getHeight();
+                if (h > 0 && h <= maxH && w >= sw * 0.6 && !rvIdNameHas(pv, "minplayer")) best = pv;
+                else break;
+                cur = pv;
+                p = cur.getParent();
+            }
+            if (best.getVisibility() != android.view.View.GONE) {
+                best.setVisibility(android.view.View.GONE);
+                if (!sUiCleanHidden.contains(best)) sUiCleanHidden.add(best);
+                n++;
+                // v1.0.21-fix2: 每次隐藏都记明细(类/id/尺寸/锚文本) —— 不再依赖一次性链日志定位误伤
+                int[] bloc = new int[2];
+                best.getLocationOnScreen(bloc);
+                flog("SET", "横幅隐藏: <" + best.getClass().getSimpleName()
+                        + " id=" + rvIdNameSafe(best) + " " + best.getWidth() + "x" + best.getHeight()
+                        + " @" + bloc[0] + "," + bloc[1] + "> anchor=" + cs);
+                if (!sUiCleanChainLogged) {
+                    sUiCleanChainLogged = true;
+                    logUiChain(best);
+                }
+            }
+        }
+        return n;
+    }
+
+    // 视图 id 条目名包含 kw(小写); 无 id/解析失败 = false。防误伤 minPlayerBar 等语义 id 容器
+    private static boolean rvIdNameHas(android.view.View v, String kw) {
+        try {
+            int id = v.getId();
+            if (id == android.view.View.NO_ID) return false;
+            String n = v.getResources().getResourceEntryName(id);
+            return n != null && n.toLowerCase().contains(kw);
+        } catch (Throwable t) { return false; }
+    }
+
+    private static String rvIdNameSafe(android.view.View v) {
+        try {
+            int id = v.getId();
+            if (id == android.view.View.NO_ID) return "-";
+            String n = v.getResources().getResourceEntryName(id);
+            return n == null ? "-" : n;
+        } catch (Throwable t) { return "-"; }
+    }
+
     private static boolean subtreeHasAnyDesc(android.view.View v, String[] texts, int depth) {
         if (v == null) return false;
         CharSequence cd = v.getContentDescription();
@@ -3041,6 +3126,8 @@ public class MainHook implements IXposedHookLoadPackage {
             g1.add(miRow(act, "抽屉菜单精简", "隐藏抽屉侧栏菜单项(我的消息→我的客服), 重启恢复", swDrawer));
             android.widget.Switch swBottomMid = miSwitch(act, prefBottomMidHide);
             g1.add(miRow(act, "隐藏底栏中间入口", "隐藏底栏中间的「笔记/关注」tab, 重启恢复", swBottomMid));
+            android.widget.Switch swStickyBanner = miSwitch(act, prefStickyBannerHide);
+            g1.add(miRow(act, "隐藏免费听横幅", "隐藏播放条上方「免费听时长已耗尽」推广条, 即时生效", swStickyBanner));
             addGroup(act, panel, d, "g1", "界面与清理", false, g1, 0);
 
             // ---------- 抽屉VIP卡图片: 预览 + 选图 (v8.7) ----------
@@ -3227,6 +3314,14 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (checked) scheduleUiCleanScan();
                     else restoreUiCleanViews();
                     flog("SET", "隐藏底栏中间入口 -> " + checked);
+                }
+            });
+            swStickyBanner.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                    prefStickyBannerHide = checked; savePref(act, "stick_banner_hide", checked);
+                    if (checked) scheduleUiCleanScan();
+                    else restoreUiCleanViews();
+                    flog("SET", "隐藏免费听横幅 -> " + checked);
                 }
             });
             swAd.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
@@ -3716,8 +3811,20 @@ public class MainHook implements IXposedHookLoadPackage {
     // LSPosed 日志白名单: 只镜像 装载确认(INIT) + 用户操作(SET)。其余(过滤明细/HTTP/CMENC/serialdata/
     // 探针/页面事件等)只进 cm_hook.log(宿主私有目录) —— LSPosed 缓冲区保持干净(09-21 用户要求"减少到最少")。
     // 模块崩溃类错误由 LSPosed 自身记录(如 Failed to load class), 不依赖镜像。
-    private static final java.util.HashSet<String> LSP_TAGS = new java.util.HashSet<String>(java.util.Arrays.asList(
-            "INIT", "SET"));
+    // v1.0.21-fix3: LSPosed 镜像收紧为"仅装载存活信号" —— 常规日志(含 SET 明细/INIT 全量)一律只进 cm_hook.log。
+    //   LSPosed 每进程只会有 2~3 行(handleLoadPackage / 业务hook安装完成); 排障用 su 读文件日志。
+    //   LSP_TAGS 机制保留(紧急时把标签加回来即可镜像)。
+    private static final java.util.HashSet<String> LSP_TAGS = new java.util.HashSet<String>();
+
+    // 一次性 LSPosed 存活信号: 按 key 去重, 每进程每 key 至多一行
+    private static final java.util.HashSet<String> LSP_ONCE = new java.util.HashSet<String>();
+
+    private static void lspOnce(String key, String msg) {
+        synchronized (LSP_ONCE) {
+            if (!LSP_ONCE.add(key)) return;
+        }
+        try { XposedBridge.log(msg); } catch (Throwable t) { }
+    }
 
     private static void flog(String tag, String msg) {
         String line = TS.format(new Date()) + " [" + tag + "] " + msg;
@@ -4025,8 +4132,92 @@ public class MainHook implements IXposedHookLoadPackage {
     //   改为跟**自身 userId** 比; 自身 userId 从库里推定: 每一行不管哪一列写的是我, 我的 id 都会出现一次
     //   (801/801), 对方 id 只出现在自己那几行 → 两列合并计数取最大者即"我"。
     private static volatile String rvMyId = null;
+    // v1.0.20-fix: 自身 uid 以"登录态"为最高优先 —— 每用户 MMKV 文件名里带 uid, 取最近被写的那个账号。
+    //   库里"两列合并计数"推定降级为兜底: 换账号登录后库的数值分布不变(该会话两列恒为 对方id/自己id, 恰好对换号免疫),
+    //   推定值停在旧账号 → 自己发的被当"对方撤回"记账、对方真撤回反而被跳过(2026-09-27 K60 换号实锤)。
+    private static volatile String rvLoginUid = null;
+    private static volatile long rvLoginUidAt = 0L;
+    private static final java.util.regex.Pattern RV_UID_IN_NAME = java.util.regex.Pattern.compile("(?<!\\d)\\d{10}(?!\\d)");
+
+    private static String rvResolveLoginUid() {
+        long now = System.currentTimeMillis();
+        if (now - rvLoginUidAt < 10000L) return rvLoginUid;    // 10s 缓存: 巡检器在主线程, 别高频扫目录
+        rvLoginUidAt = now;
+        try {
+            java.io.File dir = new java.io.File("/data/data/" + TARGET_PKG + "/files/mmkv");
+            java.io.File[] fs = dir.listFiles();
+            if (fs != null) {
+                java.util.HashMap<String, Long> latest = new java.util.HashMap<String, Long>();
+                java.util.HashMap<String, Integer> fileCnt = new java.util.HashMap<String, Integer>();
+                for (int i = 0; i < fs.length; i++) {
+                    String n = fs[i].getName();
+                    if (n.endsWith(".crc")) continue;
+                    java.util.regex.Matcher m = RV_UID_IN_NAME.matcher(n);
+                    while (m.find()) {
+                        String uid = m.group();
+                        Long t = latest.get(uid);
+                        if (t == null || fs[i].lastModified() > t.longValue())
+                            latest.put(uid, Long.valueOf(fs[i].lastModified()));
+                        Integer c = fileCnt.get(uid);
+                        fileCnt.put(uid, Integer.valueOf(c == null ? 1 : c.intValue() + 1));
+                    }
+                }
+                String best = null;
+                long bestT = -1L;
+                for (java.util.Map.Entry<String, Long> e : latest.entrySet()) {
+                    Integer c = fileCnt.get(e.getKey());
+                    if (c == null || c.intValue() < 2) continue;   // 单文件命中可能是歌曲id等巧合, 须≥2个文件
+                    if (e.getValue().longValue() > bestT) { bestT = e.getValue().longValue(); best = e.getKey(); }
+                }
+                if (best != null) {
+                    if (!best.equals(rvLoginUid))
+                        flog("ANTIREVOKE", "登录态 uid: " + best
+                                + (rvMyId != null && !rvMyId.equals(best) ? " (与库推定 " + rvMyId + " 冲突, 以登录态为准)" : ""));
+                    rvLoginUid = best;
+                }
+            }
+        } catch (Throwable t) { }
+        return rvLoginUid;
+    }
+
+    // 生效的自身 uid: 登录态最高优先; 读不到才退库推定值。
+    // rvMyNick 从活消息自学(发送方==自己那条的昵称), 供旧格式台账条目(无 sender uid)按昵称过滤; 换号即失效重学
+    private static volatile String rvMyNick = null;
+
+    private static String rvMyIdEffective() {
+        String login = rvResolveLoginUid();
+        if (login != null) {
+            if (!login.equals(rvMyId)) {
+                rvMyId = login;
+                rvMyNick = null;                               // 换号: 昵称缓存作废
+            }
+            return login;
+        }
+        return rvMyId;
+    }
+
+    // 台账条目是否按"当前登录视角"展示 —— 发送方==当前登录的条目跳过(跨账号残留/自己撤回不该出现在对方台账里)
+    private static final java.util.regex.Pattern RV_NICK_IN_TEXT =
+            java.util.regex.Pattern.compile("\\d{2}-\\d{2} \\d{2}:\\d{2}\\s+(.+)： .*", java.util.regex.Pattern.DOTALL);
+
+    private static boolean rvEntryVisible(String sid, String text) {
+        String me = rvMyIdEffective();
+        if (sid != null && sid.length() > 0)
+            return me == null || !sid.equals(me);
+        // 旧格式条目无 sender uid: 用文本开头 "MM-dd HH:mm  昵称： " 与当前登录昵称比对
+        if (rvMyNick != null && text != null) {
+            java.util.regex.Matcher m = RV_NICK_IN_TEXT.matcher(text);
+            if (m.matches() && rvMyNick.equals(m.group(1))) return false;
+        }
+        return true;
+    }
 
     private static String rvResolveMyId(android.database.sqlite.SQLiteDatabase db) {
+        String login = rvResolveLoginUid();                    // v1.0.20-fix: 登录态可用时不再做库推定
+        if (login != null) {
+            if (!login.equals(rvMyId)) rvMyId = login;
+            return rvMyId;
+        }
         String cached = rvMyId;
         if (cached != null) return cached;
         android.database.Cursor c = null;
@@ -4056,10 +4247,10 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // 是否"自己发出的"(自己撤回不记)。优先用推定的自身 userId; 未推定时回退旧判据(senderId != 会话id 即自己)
+    // 是否"自己发出的"(自己撤回不记)。优先用登录态/推定的自身 userId; 未推定时回退旧判据(senderId != 会话id 即自己)
     private static boolean rvIsMine(String sid, String ch) {
         if (sid == null || sid.length() == 0) return false;
-        String me = rvMyId;
+        String me = rvMyIdEffective();                         // v1.0.20-fix: 每次走登录态, 换号 10s 内自适应
         if (me != null) return sid.equals(me);
         return ch != null && ch.length() > 0 && !sid.equals(ch);
     }
@@ -4086,10 +4277,20 @@ public class MainHook implements IXposedHookLoadPackage {
             while ((ln = br.readLine()) != null) {
                 ln = ln.trim();
                 if (ln.length() == 0) continue;
+                // v1.0.20-fix2: 值格式 = "ch\u0001sid\u0001text"(新); 兼容旧 "ch\u0001text"(无sid) 与裸文本
+                //   text 本身可能含 " | ", 尾段必须拼回
                 String[] parts = ln.split(" \\| ");
-                if (parts.length >= 3) RV_MAP.put(parts[0], parts[1] + "\u0001" + parts[2]);
-                else if (parts.length == 2) RV_MAP.put(parts[0], "" + "\u0001" + parts[1]);   // 旧格式兼容
-                else RV_MAP.put("k" + RV_MAP.size(), "" + "\u0001" + ln);
+                if (parts.length >= 4) {
+                    StringBuilder sb = new StringBuilder(parts[3]);
+                    for (int k = 4; k < parts.length; k++) sb.append(" | ").append(parts[k]);
+                    RV_MAP.put(parts[0], parts[1] + "\u0001" + parts[2] + "\u0001" + sb);
+                } else if (parts.length == 3) {
+                    RV_MAP.put(parts[0], parts[1] + "\u0001\u0001" + parts[2]);
+                } else if (parts.length == 2) {
+                    RV_MAP.put(parts[0], "\u0001\u0001" + parts[1]);
+                } else {
+                    RV_MAP.put("k" + RV_MAP.size(), "\u0001\u0001" + ln);
+                }
             }
             br.close();
             flog("ANTIREVOKE", "撤回台账载入: " + RV_MAP.size() + " 条");
@@ -4098,17 +4299,32 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static synchronized boolean rvHasRecord(String msgId) { rvLoad(); return RV_MAP.containsKey(msgId); }
 
-    private static synchronized void rvRecord(String msgId, String ch, String text) {
+    private static synchronized void rvRecord(String msgId, String ch, String sid, String text) {
         rvLoad();
         if (RV_MAP.containsKey(msgId)) return;
         try {
-            RV_MAP.put(msgId, ch + "\u0001" + text);
+            RV_MAP.put(msgId, ch + "\u0001" + (sid == null ? "" : sid) + "\u0001" + text);
             java.io.FileOutputStream os = new java.io.FileOutputStream(new java.io.File(RV_FILE), true);
-            os.write((msgId + " | " + ch + " | " + text + "\n").getBytes("UTF-8"));
+            os.write((msgId + " | " + ch + " | " + (sid == null ? "" : sid) + " | " + text + "\n").getBytes("UTF-8"));
             os.flush();
             os.close();
             flog("ANTIREVOKE", "记账[" + ch + "]: " + text);
         } catch (Throwable t) { }
+    }
+
+    // 台账值三段解析(ch / senderUid / text) —— v1.0.20-fix2 起 sid 段用于"当前登录视角"过滤
+    private static String rvEntryCh(String v) { int i = v.indexOf('\u0001'); return i > 0 ? v.substring(0, i) : ""; }
+    private static String rvEntrySid(String v) {
+        int i = v.indexOf('\u0001');
+        if (i < 0) return "";
+        int j = v.indexOf('\u0001', i + 1);
+        return (j > i) ? v.substring(i + 1, j) : "";
+    }
+    private static String rvEntryText(String v) {
+        int i = v.indexOf('\u0001');
+        if (i < 0) return v;
+        int j = v.indexOf('\u0001', i + 1);
+        return (j > i) ? v.substring(j + 1) : v.substring(i + 1);
     }
 
     // v7.4: 当前页面自己的聊天列表(视图树优先 —— 全局适配器可能是别页/别会话的快照)
@@ -4167,9 +4383,28 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { return ""; }
     }
 
-    // 台账文本: 时间 + 昵称 + 正文
+    // 台账文本: 时间 + 昵称 + 正文。v1.0.20: 图片消息在此(唯一"消息还活着"的时刻)触发留存
     private static String rvTextFor(Object item) {
         String txt = rvTextOf(item);
+        String imgUrl = rvImageUrlOf(item);
+        boolean img = false;
+        if (imgUrl != null) {
+            img = true;                     // 有附件 URL → 图片, 顺带后台留存
+        } else if (txt != null && (txt.contains("[图片]") || txt.contains("[Picture]"))) {
+            img = true;                     // brief 命中但 URL 没取到(解析失败也要有文案)
+        }
+        if (img && (txt == null || txt.length() == 0)) txt = "[图片]";
+        if (img) {
+            Object mid = rvCall(item, "getId");
+            String mids = mid == null ? null : String.valueOf(mid);
+            // v1.0.20: 留存双路 —— 本地缓存拷贝优先(活消息才有路径), 失败/没有 → URL 下载兜底
+            String local = rvLocalImgOf(item);
+            if (local != null) {
+                rvPreserveLocal(mids, local);
+            } else if (imgUrl != null) {
+                rvPreserveImage(mids, imgUrl);
+            }
+        }
         if (txt == null || txt.length() == 0) return null;
         String nick = rvNickOf(item);
         String t = "";
@@ -4473,7 +4708,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static java.util.List<?> rvQueryDbDirect(String channelId) {
         if (channelId == null || channelId.length() == 0) return null;
         // v1.0.18: 会话 id 若等于"我自己"(宿主偶发把 channel 解析成自身 id), 按它查会一次拉出全部会话 → 拒绝
-        String meNow = rvMyId;
+        String meNow = rvMyIdEffective();                      // v1.0.20-fix: 走登录态, 防换号后旧值
         if (meNow != null && meNow.equals(channelId)) {
             flog("ANTIREVOKE", "直连SQL: 会话id=" + channelId + " 等于自身 userId, 跳过(无法区分会话)");
             return null;
@@ -4512,7 +4747,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 long ts = cur.isNull(2) ? 0L : cur.getLong(2);
                 String brief = cur.isNull(3) ? null : cur.getString(3);
                 String raw = cur.isNull(4) ? null : cur.getString(4);
-                String nick = null, text = brief, sid2 = sid;
+                String nick = null, text = brief, sid2 = sid, imgUrl = null;
                 if (raw != null && raw.length() > 0) {
                     try {
                         Object jo = joNew(raw);
@@ -4527,10 +4762,30 @@ public class MainHook implements IXposedHookLoadPackage {
                                 String uid = joStr(user, "userId");
                                 if ((sid2 == null || sid2.length() == 0) && uid != null) sid2 = uid;
                             }
+                            // v1.0.20: 图片 URL 提取 —— 9.6.05 实测(SQL_PROBE msgId=355384078746):
+                            //   msgBody.body 是"嵌套 JSON 字符串"(nimlib FileAttachment 序列化),
+                            //   url/imageUrl 在 body 串里; 旧布局 msgBody.image 直挂的走下面兼容。
+                            String bodyStr = joStr(mb, "body");
+                            if (bodyStr != null && bodyStr.startsWith("{")) {
+                                try {
+                                    Object bj = joNew(bodyStr);
+                                    String u = joStr(bj, "url");
+                                    if (u == null || !u.startsWith("http")) u = joStr(bj, "imageUrl");
+                                    if (u != null && u.startsWith("http")) imgUrl = u;
+                                } catch (Throwable t2) { }
+                            }
+                            if (imgUrl == null) {
+                                Object imObj = joGetObj(mb, "image");
+                                if (imObj != null) {
+                                    String u = joStr(imObj, "url");
+                                    if (u != null && u.startsWith("http")) imgUrl = u;
+                                }
+                            }
+                            if (imgUrl != null && (text == null || text.length() == 0)) text = "[图片]";
                         }
                     } catch (Throwable t) { }
                 }
-                out.add(new RvRow(mid, sid2 == null ? "" : sid2, ts, text, nick));
+                out.add(new RvRow(mid, sid2 == null ? "" : sid2, ts, text, nick, imgUrl));
             }
             if (!out.isEmpty()) {
                 long now = System.currentTimeMillis();
@@ -4627,23 +4882,31 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // 直连SQL 的行对象: getter 命名与宿主 RawMessage 对齐 → 下游 rvCall 反射无缝复用
+    // v1.0.20: 带 imgUrl(来自 msgStr 的 msgBody.image.url), getAttachment() 与 nimlib 活消息同构
     private static final class RvRow {
-        final String msgId, senderId, text, nick;
+        final String msgId, senderId, text, nick, imgUrl;
         final long ts;
-        RvRow(String id, String sid, long t, String txt, String nk) {
-            msgId = id; senderId = sid; ts = t; text = txt; nick = nk;
+        RvRow(String id, String sid, long t, String txt, String nk, String iu) {
+            msgId = id; senderId = sid; ts = t; text = txt; nick = nk; imgUrl = iu;
         }
         public String getId() { return msgId; }
         public long getMsgTime() { return ts; }
-        public Object getMsgBody() { return new RvBody(senderId, text, nick); }
+        public Object getMsgBody() { return new RvBody(senderId, text, nick, imgUrl); }
     }
 
     private static final class RvBody {
-        final String sid, text, nick;
-        RvBody(String s, String t, String n) { sid = s; text = t; nick = n; }
+        final String sid, text, nick, imgUrl;
+        RvBody(String s, String t, String n, String iu) { sid = s; text = t; nick = n; imgUrl = iu; }
         public String getBriefText() { return text; }
         public Object getBody() { return new RvText(text); }
         public Object getSender() { return new RvSender(sid, nick); }
+        public Object getAttachment() { return imgUrl == null ? null : new RvImgAtt(imgUrl); }
+    }
+
+    private static final class RvImgAtt {
+        final String url;
+        RvImgAtt(String u) { url = u; }
+        public String getUrl() { return url; }
     }
 
     private static final class RvText {
@@ -4664,6 +4927,346 @@ public class MainHook implements IXposedHookLoadPackage {
         RvUser(String s, String n) { sid = s; nick = n; }
         public String getUserId() { return sid; }
         public String getNickname() { return nick; }
+    }
+
+    // ===== v1.0.20: 撤回图片留存 =====
+    //   图片消息(msgType=1, msgBody.image.url)只在"消息还活着"时可取 —— 三源记账都会先走 rvTextFor,
+    //   那是唯一的留存时机: 提取 URL → 后台线程下载到宿主私有 files/cmhook_rv/<msgId>.img。
+    //   撤回只删库行/列表项, 追不回已删的图; 留存成功与否与文本记账互不影响。
+    //   图片路径不入 cmhook_revoke.txt(保持"msgId | ch | 文本"格式), 另存映射文件按 msgId 关联。
+    private static final String RV_IMG_DIR = "/data/data/" + TARGET_PKG + "/files/cmhook_rv";
+    private static final String RV_IMG_FILE = "/data/data/" + TARGET_PKG + "/files/cmhook_revoke_img.txt";
+    private static final java.util.HashMap<String, String> RV_IMG = new java.util.HashMap<String, String>();   // msgId → 本地路径
+    private static volatile boolean rvImgLoaded = false;
+    private static final java.util.HashSet<String> RV_IMG_BUSY = new java.util.HashSet<String>();
+
+    private static synchronized void rvImgLoad() {
+        if (rvImgLoaded) return;
+        rvImgLoaded = true;
+        try {
+            java.io.File f = new java.io.File(RV_IMG_FILE);
+            if (!f.exists()) return;
+            java.io.BufferedReader br = new java.io.BufferedReader(new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
+            String ln;
+            while ((ln = br.readLine()) != null) {
+                ln = ln.trim();
+                if (ln.length() == 0) continue;
+                int sp = ln.indexOf(" | ");
+                if (sp <= 0) continue;
+                String p = ln.substring(sp + 3);
+                if (new java.io.File(p).exists()) RV_IMG.put(ln.substring(0, sp), p);
+            }
+            br.close();
+            flog("ANTIREVOKE", "图片留存索引载入: " + RV_IMG.size() + " 张");
+        } catch (Throwable t) { flog("ANTIREVOKE", "图片索引载入失败: " + t); }
+    }
+
+    private static String rvImgPathFor(String msgId) {
+        if (msgId == null || msgId.length() == 0) return null;
+        rvImgLoad();
+        synchronized (RV_IMG) {
+            String p = RV_IMG.get(msgId);
+            return (p != null && new java.io.File(p).exists()) ? p : null;
+        }
+    }
+
+    private static synchronized void rvRecordImg(String msgId, String path) {
+        synchronized (RV_IMG) { RV_IMG.put(msgId, path); }
+        try {
+            java.io.FileOutputStream os = new java.io.FileOutputStream(new java.io.File(RV_IMG_FILE), true);
+            os.write((msgId + " | " + path + "\n").getBytes("UTF-8"));
+            os.flush();
+            os.close();
+        } catch (Throwable t) { }
+    }
+
+    // 图片 URL: 活消息走反射 getMsgBody() 的附件链(nimlib ImageAttachment.getUrl());
+    // 备选 getBody() 直挂 getUrl() —— 9.6.05 实测 body 序列化键是 url/imageUrl, 反序列化对象同名。
+    // 直连 SQL 行的 RvBody.getAttachment() 与该链同构, 两路通吃。
+    private static String rvImageUrlOf(Object item) {
+        try {
+            Object mb = rvCall(item, "getMsgBody");
+            Object att = rvCall(mb, "getAttachment");
+            if (att != null) {
+                Object u = rvCall(att, "getUrl");
+                String s = rvStr(u);
+                if (s != null && s.startsWith("http")) return s;
+            }
+            Object b = rvCall(mb, "getBody");
+            if (b != null) {
+                Object u = rvCall(b, "getUrl");
+                String s = rvStr(u);
+                if (s != null && s.startsWith("http")) return s;
+            }
+        } catch (Throwable t) { }
+        return null;
+    }
+
+    // 目录容量护栏: 超过 cap 删最旧(留的是撤回孤本, 但不能无限吃盘)
+    private static void rvTrimImgDir(java.io.File dir, long capBytes) {
+        try {
+            java.io.File[] fs = dir.listFiles();
+            if (fs == null) return;
+            long total = 0;
+            for (java.io.File f : fs) total += f.length();
+            if (total <= capBytes) return;
+            java.util.Arrays.sort(fs, new java.util.Comparator<java.io.File>() {
+                public int compare(java.io.File a, java.io.File b) {
+                    return Long.compare(a.lastModified(), b.lastModified());
+                }
+            });
+            for (java.io.File f : fs) {
+                if (total <= capBytes) break;
+                total -= f.length();
+                f.delete();
+            }
+        } catch (Throwable t) { }
+    }
+
+    // 本地缓存路径: 活消息的附件对象上, 显示过的图会有 path/thumbPath/cachePath 指向宿主缓存。
+    // 注意: 库行(body JSON)里这些字段实测多为空串 —— 本地优先只在活消息路径可用, 库行走 URL。
+    private static String rvLocalImgOf(Object item) {
+        try {
+            Object mb = rvCall(item, "getMsgBody");
+            Object cand = rvCall(mb, "getAttachment");
+            if (cand == null) cand = rvCall(mb, "getBody");
+            if (cand == null) return null;
+            String[] getters = {"getPath", "getThumbPath", "getCachePath"};
+            for (int i = 0; i < getters.length; i++) {
+                Object p = rvCall(cand, getters[i]);
+                String s = rvStr(p);
+                if (s != null && s.length() > 4 && s.startsWith("/")) {
+                    java.io.File f = new java.io.File(s);
+                    if (f.exists() && f.length() > 0) return s;
+                }
+            }
+        } catch (Throwable t) { }
+        return null;
+    }
+
+    // 本地拷贝留存(优先路): 零网络, 从宿主缓存直接拷进模块目录
+    private static void rvPreserveLocal(final String msgId, final String srcPath) {
+        if (msgId == null || msgId.length() == 0 || srcPath == null) return;
+        rvImgLoad();
+        synchronized (RV_IMG) { if (RV_IMG.containsKey(msgId)) return; }
+        synchronized (RV_IMG_BUSY) { if (!RV_IMG_BUSY.add(msgId)) return; }
+        new Thread(new Runnable() { public void run() {
+            try {
+                java.io.File dir = new java.io.File(RV_IMG_DIR);
+                if (!dir.exists()) dir.mkdirs();
+                rvTrimImgDir(dir, 50L * 1024 * 1024);
+                java.io.File dst = new java.io.File(dir, msgId + ".img");
+                if (dst.exists()) dst.delete();
+                rvCopyFile(new java.io.File(srcPath), dst);
+                if (!dst.exists() || dst.length() < 64) throw new IllegalStateException("拷贝失败或文件过小");
+                rvRecordImg(msgId, dst.getAbsolutePath());
+                flog("ANTIREVOKE", "图片留存(本地拷贝): " + msgId + " (" + dst.length() + " B)");
+            } catch (Throwable t) {
+                flog("ANTIREVOKE", "本地留存失败(" + msgId + "): " + t);
+            } finally {
+                synchronized (RV_IMG_BUSY) { RV_IMG_BUSY.remove(msgId); }
+            }
+        }}, "cmhook-rvimg").start();
+    }
+
+    private static void rvPreserveImage(final String msgId, final String url) {
+        if (msgId == null || msgId.length() == 0 || url == null || url.length() == 0) return;
+        rvImgLoad();
+        synchronized (RV_IMG) { if (RV_IMG.containsKey(msgId)) return; }
+        synchronized (RV_IMG_BUSY) { if (!RV_IMG_BUSY.add(msgId)) return; }
+        new Thread(new Runnable() { public void run() {
+            java.io.File tmp = null;
+            try {
+                java.io.File dir = new java.io.File(RV_IMG_DIR);
+                if (!dir.exists()) dir.mkdirs();
+                rvTrimImgDir(dir, 50L * 1024 * 1024);
+                tmp = new java.io.File(dir, msgId + ".part");
+                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                conn.setConnectTimeout(10000);
+                conn.setReadTimeout(15000);
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36");
+                java.io.InputStream in = conn.getInputStream();
+                java.io.FileOutputStream out = new java.io.FileOutputStream(tmp);
+                byte[] buf = new byte[32768];
+                long total = 0;
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    total += n;
+                    if (total > 20L * 1024 * 1024) throw new IllegalStateException("图片超过 20MB 上限");
+                    out.write(buf, 0, n);
+                }
+                out.close();
+                in.close();
+                if (total < 64) throw new IllegalStateException("响应过小(" + total + "B), 疑似非图片");
+                java.io.File dst = new java.io.File(dir, msgId + ".img");
+                if (dst.exists()) dst.delete();
+                if (!tmp.renameTo(dst)) throw new IllegalStateException("rename 失败");
+                tmp = null;
+                rvRecordImg(msgId, dst.getAbsolutePath());
+                flog("ANTIREVOKE", "图片留存: " + msgId + " (" + total + " B)");
+            } catch (Throwable t) {
+                flog("ANTIREVOKE", "图片留存失败(" + msgId + "): " + t);
+                try { if (tmp != null) tmp.delete(); } catch (Throwable t2) { }
+            } finally {
+                synchronized (RV_IMG_BUSY) { RV_IMG_BUSY.remove(msgId); }
+            }
+        }}, "cmhook-rvimg").start();
+    }
+
+    // 浮层缩略图解码(按目标边长取 inSampleSize, 防大图炸内存)
+    private static android.graphics.Bitmap rvDecodeSampled(String path, int target) {
+        try {
+            android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeFile(path, o);
+            int sample = 1;
+            int maxDim = Math.max(o.outWidth, o.outHeight);
+            while (maxDim / (sample * 2) >= target) sample *= 2;
+            android.graphics.BitmapFactory.Options o2 = new android.graphics.BitmapFactory.Options();
+            o2.inSampleSize = sample;
+            return android.graphics.BitmapFactory.decodeFile(path, o2);
+        } catch (Throwable t) { return null; }
+    }
+
+    // 点缩略图 → 全屏看图(长图可滚, 点图关闭)
+    private static void rvShowImage(final android.app.Activity act, final String path) {
+        try {
+            android.graphics.Bitmap bm = rvDecodeSampled(path, 2048);
+            if (bm == null) { flog("ANTIREVOKE", "看图解码失败: " + path); return; }
+            android.app.Dialog dlg = new android.app.Dialog(act);
+            dlg.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0xEE000000));
+            android.widget.ImageView iv = new android.widget.ImageView(act);
+            iv.setImageBitmap(bm);
+            iv.setAdjustViewBounds(true);
+            android.widget.ScrollView sv = new android.widget.ScrollView(act);
+            sv.addView(iv, new android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+            dlg.setContentView(sv, new android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT));
+            dlg.setCancelable(true);
+            iv.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    rvDismissSavePopup();
+                    try { dlg.dismiss(); } catch (Throwable t) { }
+                }
+            });
+            // v1.0.20: 长按 = 保存弹窗(跟随图片)
+            iv.setOnLongClickListener(new android.view.View.OnLongClickListener() {
+                public boolean onLongClick(android.view.View v) { rvShowSavePopup(v, path); return true; }
+            });
+            dlg.show();
+        } catch (Throwable t) { flog("ANTIREVOKE", "看图失败: " + t); }
+    }
+
+    // ===== v1.0.20: 长按图片 → 保存到 Download =====
+    //   全屏看图与浮层缩略图都挂长按; 弹 Miuix 风单按钮小窗(点外部/返回键关闭)。
+    //   保存: Android 10+ 走 MediaStore.Downloads(相对路径 Download/, 无需权限);
+    //   低版本直写公共 Download(无权限时退应用外部私有目录) —— 结果一律 Toast 带实际路径。
+    private static android.widget.PopupWindow rvSavePopup = null;
+
+    private static void rvDismissSavePopup() {
+        try { if (rvSavePopup != null) rvSavePopup.dismiss(); } catch (Throwable t) { }
+        rvSavePopup = null;
+    }
+
+    // 弹窗跟随长按的图片: 锚点(被长按的 ImageView)右下方向下弹出, 不再固定居中
+    private static void rvShowSavePopup(final android.view.View anchor, final String path) {
+        try {
+            rvDismissSavePopup();
+            if (!(anchor.getContext() instanceof android.app.Activity)) return;
+            final android.app.Activity act = (android.app.Activity) anchor.getContext();
+            float d = miDens(act);
+            android.widget.LinearLayout box = new android.widget.LinearLayout(act);
+            box.setOrientation(android.widget.LinearLayout.VERTICAL);
+            box.setBackground(miBg(0xFF262629, 14 * d));
+            int pad = (int) (6 * d);
+            box.setPadding(pad, pad, pad, pad);
+            android.widget.TextView btn = miText(act, "保存到 Download", 14, 0xFFEC4141, true);
+            btn.setPadding((int) (14 * d), (int) (12 * d), (int) (14 * d), (int) (12 * d));
+            btn.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    rvDismissSavePopup();
+                    rvSaveImageToDownload(act, path);
+                }
+            });
+            box.addView(btn);
+            rvSavePopup = new android.widget.PopupWindow(box, (int) (190 * d),
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT, true);
+            rvSavePopup.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0));
+            rvSavePopup.setOutsideTouchable(true);
+            rvSavePopup.showAsDropDown(anchor, (int) (10 * d), (int) (10 * d));
+        } catch (Throwable t) { flog("ANTIREVOKE", "保存弹窗失败: " + t); }
+    }
+
+    private static void rvSaveImageToDownload(final android.app.Activity act, final String path) {
+        new Thread(new Runnable() { public void run() {
+            final String[] res = new String[]{null, null};
+            try {
+                java.io.File src = new java.io.File(path);
+                if (!src.exists() || src.length() == 0) throw new IllegalStateException("源文件不存在");
+                // 魔数定扩展名(.img 裸存时无后缀)
+                String ext = "jpg", mime = "image/jpeg";
+                try {
+                    java.io.InputStream h = new java.io.FileInputStream(src);
+                    byte[] m = new byte[12];
+                    int hn = h.read(m);
+                    h.close();
+                    if (hn >= 4) {
+                        if ((m[0] & 0xFF) == 0x89 && m[1] == 'P') { ext = "png"; mime = "image/png"; }
+                        else if ((m[0] & 0xFF) == 0xFF && (m[1] & 0xFF) == 0xD8) { ext = "jpg"; mime = "image/jpeg"; }
+                        else if (m[0] == 'R' && m[1] == 'I' && m[2] == 'F' && m[3] == 'F') { ext = "webp"; mime = "image/webp"; }
+                    }
+                } catch (Throwable t) { }
+                String nm = src.getName();
+                if (nm.endsWith(".img")) nm = nm.substring(0, nm.length() - 4);
+                final String name = "cmhook_" + nm + "." + ext;
+                String where = null;
+                if (android.os.Build.VERSION.SDK_INT >= 29) {
+                    android.content.ContentValues cv = new android.content.ContentValues();
+                    cv.put("_display_name", name);
+                    cv.put("mime_type", mime);
+                    cv.put("relative_path", "Download/");
+                    android.net.Uri uri = act.getContentResolver().insert(
+                            android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                    if (uri == null) throw new IllegalStateException("MediaStore 插入被拒");
+                    java.io.OutputStream os = act.getContentResolver().openOutputStream(uri);
+                    if (os == null) throw new IllegalStateException("输出流打开失败");
+                    java.io.FileInputStream in = new java.io.FileInputStream(src);
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                    in.close();
+                    os.close();
+                    where = "Download/" + name;
+                } else {
+                    java.io.File dst = new java.io.File(
+                            android.os.Environment.getExternalStoragePublicDirectory(
+                                    android.os.Environment.DIRECTORY_DOWNLOADS), name);
+                    try {
+                        rvCopyFile(src, dst);
+                        where = dst.getAbsolutePath();
+                    } catch (Throwable tPub) {
+                        // 公共存储无权限 → 退应用外部私有目录
+                        java.io.File fb = new java.io.File(act.getExternalFilesDir((String) null), "Download/" + name);
+                        fb.getParentFile().mkdirs();
+                        rvCopyFile(src, fb);
+                        where = fb.getAbsolutePath();
+                    }
+                }
+                res[0] = where;
+            } catch (Throwable t) {
+                res[1] = String.valueOf(t);
+            }
+            final android.app.Activity fAct = act;
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() { public void run() {
+                try {
+                    android.widget.Toast.makeText(fAct,
+                            res[0] != null ? "已保存: " + res[0] : "保存失败: " + res[1],
+                            android.widget.Toast.LENGTH_SHORT).show();
+                } catch (Throwable t) { }
+            }});
+            flog("ANTIREVOKE", res[0] != null ? "图片已保存: " + res[0] : "图片保存失败: " + res[1]);
+        }}, "cmhook-rvsave").start();
     }
 
     private static String rvTextOf(Object item) {
@@ -4713,7 +5316,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     flog("ANTIREVOKE", "列表消失但是自己发的, 跳过: " + body);
                     continue;
                 }
-                rvRecord(e.getKey(), ch, body);
+                rvRecord(e.getKey(), ch, sid, body);
                 added++;
                 gone.add(e.getKey());
             }
@@ -4728,7 +5331,15 @@ public class MainHook implements IXposedHookLoadPackage {
             if (!curIds.contains(mid)) continue;
             synchronized (seen) { if (seen.containsKey(mid)) continue; }
             String sid = rvSenderIdOf(item);
-            if (rvIsMine(sid, ch)) continue;           // v1.0.17: 只把对方的消息写进"见过"表
+            boolean mine = rvIsMine(sid, ch);
+            if (mine) {
+                // v1.0.20-fix2: 自学当前登录昵称(旧格式台账条目按昵称过滤要用; 换号后 rvMyNick 已被置空重学)
+                if (rvMyNick == null) {
+                    String nk = rvNickOf(item);
+                    if (nk != null && nk.length() > 0) rvMyNick = nk;
+                }
+                continue;           // v1.0.17: 只把对方的消息写进"见过"表
+            }
             String body = rvTextFor(item);
             if (body == null) continue;
             synchronized (seen) {
@@ -4793,7 +5404,7 @@ public class MainHook implements IXposedHookLoadPackage {
                             flog("ANTIREVOKE", "③ 复核: 行仍在库中(读取残缺), 跳过: " + ptext);
                             continue;
                         }
-                        rvRecord(e.getKey(), ch, ptext);
+                        rvRecord(e.getKey(), ch, psid, ptext);
                         added++;
                         flog("ANTIREVOKE", "③ 库条目消失→记账: " + ptext);
                     }
@@ -4819,7 +5430,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (rvIsMine(sid, ch)) continue;         // v1.0.17: 自己撤回不记(按自身 userId 判定)
                     String body = rvTextFor(it);
                     if (body == null) continue;
-                    rvRecord(mid, ch, body);
+                    rvRecord(mid, ch, sid, body);
                     added++;
                     win++;
                 }
@@ -4872,6 +5483,20 @@ public class MainHook implements IXposedHookLoadPackage {
             int sep = v.indexOf('\u0001');
             String chOf = (sep > 0) ? v.substring(0, sep) : "";
             if (chOf.equals(ch) || rvBelongsTo(ch, e.getKey())) c++;
+        }
+        return c;
+    }
+
+    // v1.0.20-fix2: UI 计数(胶囊/浮层标题) —— 按"当前登录视角"过滤后的可见条数, 与浮层列表口径一致
+    private static synchronized int rvUiCountFor(String ch) {
+        rvLoad();
+        if (ch == null || ch.length() == 0) return RV_MAP.size();
+        int c = 0;
+        for (java.util.Map.Entry<String, String> e : RV_MAP.entrySet()) {
+            String chOf = rvEntryCh(e.getValue());
+            if (!chOf.equals(ch) && !rvBelongsTo(ch, e.getKey())) continue;
+            if (!rvEntryVisible(rvEntrySid(e.getValue()), rvEntryText(e.getValue()))) continue;
+            c++;
         }
         return c;
     }
@@ -5499,7 +6124,7 @@ public class MainHook implements IXposedHookLoadPackage {
             // v7.4: 会话识别不到就不报可能错的数字(留「撤回 –」半透明), 识别到才按本会话计数
             String ch = rvCurrentChannel(act);
             if (ch.length() > 0) rvLastChForUi = ch;
-            int cnt = ch.length() > 0 ? rvCountFor(ch) : -1;
+            int cnt = ch.length() > 0 ? rvUiCountFor(ch) : -1;
             cap.setText(cnt < 0 ? "撤回 –" : "撤回 " + cnt);
             cap.setVisibility(android.view.View.VISIBLE);
             if (cnt != rvLastCapShown) {
@@ -5556,7 +6181,7 @@ public class MainHook implements IXposedHookLoadPackage {
             // v7.4: 严格本会话 —— 识别不到就不列任何条目(绝不串会话)
             String curCh = rvCurChannelId();
             if (curCh.length() == 0) curCh = rvLastChForUi;
-            int cntAll = curCh.length() == 0 ? 0 : rvCountFor(curCh);
+            int cntAll = curCh.length() == 0 ? 0 : rvUiCountFor(curCh);
             String titleStr = curCh.length() == 0
                     ? "当前会话未识别 · 暂不展示"
                     : ("本会话 #" + curCh + " 已拦截撤回 · " + cntAll + " 条");
@@ -5576,18 +6201,45 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             for (String[] pair : rvVals) {
                 if (n >= 100) break;
-                String v = pair[1];
-                int sep = v.indexOf('\u0001');
-                String chOf = (sep > 0) ? v.substring(0, sep) : "";
-                String txtOf = (sep > 0) ? v.substring(sep + 1) : v;
+                String chOf = rvEntryCh(pair[1]);
+                String txtOf = rvEntryText(pair[1]);
                 if (curCh.length() == 0) break;                       // 会话未识别: 一条都不列
                 // v1.0.15: 归属按 msgId 判定(库里两列约定不一致, 旧的纯 channel 比对会漏)
                 if (chOf.length() > 0 && !chOf.equals(curCh) && !rvBelongsTo(curCh, pair[0])) continue;
+                // v1.0.20-fix2: 当前登录视角过滤 —— 发送方==自己的条目(跨账号残留)不展示
+                if (!rvEntryVisible(rvEntrySid(pair[1]), txtOf)) continue;
                 n++;
                 android.widget.TextView row = miText(act, txtOf, 12, 0xE6FFFFFF, false);
                 row.setPadding(0, (int) (6 * d), 0, (int) (6 * d));
                 row.setTextIsSelectable(true);
                 list.addView(row);
+                // v1.0.20: 台账条目有留存图 → 文本行下方渲染缩略图, 点击看大图
+                if (pair[0] != null) {
+                    String imgPath = rvImgPathFor(pair[0]);
+                    if (imgPath != null) {
+                        android.graphics.Bitmap bm = rvDecodeSampled(imgPath, (int) (300 * d));
+                        if (bm != null) {
+                            android.widget.ImageView iv = new android.widget.ImageView(act);
+                            iv.setImageBitmap(bm);
+                            iv.setScaleType(android.widget.ImageView.ScaleType.FIT_START);
+                            iv.setAdjustViewBounds(true);
+                            iv.setMaxHeight((int) (220 * d));
+                            final android.app.Activity fAct = act;
+                            final String fPath = imgPath;
+                            iv.setOnClickListener(new android.view.View.OnClickListener() {
+                                public void onClick(android.view.View v) { rvShowImage(fAct, fPath); }
+                            });
+                            // v1.0.20: 缩略图长按 = 保存弹窗(跟随图片)
+                            iv.setOnLongClickListener(new android.view.View.OnLongClickListener() {
+                                public boolean onLongClick(android.view.View v) { rvShowSavePopup(v, fPath); return true; }
+                            });
+                            android.widget.LinearLayout.LayoutParams ilp = new android.widget.LinearLayout.LayoutParams(
+                                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+                            ilp.bottomMargin = (int) (6 * d);
+                            list.addView(iv, ilp);
+                        }
+                    }
+                }
             }
             if (n == 0) {
                 android.widget.TextView empty = miText(act, curCh.length() == 0
@@ -6697,6 +7349,7 @@ public class MainHook implements IXposedHookLoadPackage {
             flog("INIT", "默认加载器install: " + t);
         }
         flog("INIT", "handleLoadPackage完毕");
+        lspOnce("loaded", "[CMH] CM Hook 装载 process=" + lpp.processName);
     }
 
     private static void installBusinessHooks(final ClassLoader cl) {
@@ -7267,9 +7920,10 @@ public class MainHook implements IXposedHookLoadPackage {
                         Object a0 = param.args[0];
                         String t = a0 instanceof CharSequence ? a0.toString() : null;
                         if (t == null || t.length() == 0 || t.length() > 40) return;
-                        // UI 清理触发: 抽屉菜单项 / 底栏中间 tab 文本绑定时排扫描
+                        // UI 清理触发: 抽屉菜单项 / 底栏中间 tab / 免费听横幅 文本绑定时排扫描
                         if ((prefDrawerClean && textInList(t, DRAWER_ITEM_TEXTS))
-                                || (prefBottomMidHide && textInList(t, BOTTOM_MID_TEXTS))) {
+                                || (prefBottomMidHide && textInList(t, BOTTOM_MID_TEXTS))
+                                || (prefStickyBannerHide && textContainsAny(t, STICKY_BANNER_TEXTS))) {
                             scheduleUiCleanScan();
                         }
                         boolean hit = t.contains("期待您的回归") || t.contains("特权已失效") || t.contains("续费立享")
@@ -7507,6 +8161,7 @@ public class MainHook implements IXposedHookLoadPackage {
             t.start();
         } catch (Throwable t) { }
         flog("INIT", "installBusinessHooks完毕 @" + Integer.toHexString(System.identityHashCode(cl)));
+        lspOnce("hooks:" + Integer.toHexString(System.identityHashCode(cl)), "[CMH] 业务hook安装完成");
     }
 
     private static Object fieldGet(Object obj, String name) throws Exception {
