@@ -56,6 +56,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean prefProtoCollect = true;  // v22: 协议采集(关=跳过采集hook与DexKit锚点搜索)
     private static volatile boolean prefFansHide = true;      // v31: 关注页隐藏「乐迷团」项
     private static volatile boolean prefCardCustom = true;    // v8.6: 抽屉VIP挽回卡替换为自定义内容
+    private static volatile boolean prefQualityHud = true;    // v1.0.22: 播放时 HUD 显示服务器实际下发的音质
+    private static volatile boolean prefPopupClean = true;    // v1.0.22: 运营投递弹窗/浮层拦截(batch-deliver)
+    private static volatile boolean prefSplashCustom = false; // v1.0.22: 开屏图自定义(cmhook_splash.png)
     private static volatile boolean prefIdentifyLongPress = true;
     private static volatile boolean prefDrawerClean = false;     // 抽屉侧栏菜单精简(隐藏 我的消息→我的客服)
     private static volatile boolean prefBottomMidHide = false;   // 底栏中间入口(笔记/关注)隐藏
@@ -152,6 +155,9 @@ public class MainHook implements IXposedHookLoadPackage {
             prefProtoCollect = sp.getBoolean("proto_collect", true);
             prefFansHide = sp.getBoolean("fans_hide", true);
             prefCardCustom = sp.getBoolean("card_custom", true);
+            prefQualityHud = sp.getBoolean("quality_hud", true);
+            prefPopupClean = sp.getBoolean("popup_clean", true);
+            prefSplashCustom = sp.getBoolean("splash_custom", false);
             prefIdentifyLongPress = sp.getBoolean("identify_longpress", true);
             prefDrawerClean = sp.getBoolean("drawer_clean", false);
             prefBottomMidHide = sp.getBoolean("bottom_mid_hide", false);
@@ -3077,6 +3083,8 @@ public class MainHook implements IXposedHookLoadPackage {
             g1.add(miRow(act, "隐藏底栏中间入口", "隐藏底栏中间的「笔记/关注」tab, 重启恢复", swBottomMid));
             android.widget.Switch swStickyBanner = miSwitch(act, prefStickyBannerHide);
             g1.add(miRow(act, "隐藏免费听横幅", "隐藏播放条上方「免费听时长已耗尽」推广条, 即时生效", swStickyBanner));
+            android.widget.Switch swSplash = miSwitch(act, prefSplashCustom);
+            g1.add(miRow(act, "自定义开屏图", "启动闪屏换自定义图: 放图到 files/cmhook_splash.png, 重启生效", swSplash));
             addGroup(act, panel, d, "g1", "界面与清理", false, g1, 0);
 
             // ---------- 抽屉VIP卡图片: 预览 + 选图 (v8.7) ----------
@@ -3157,6 +3165,10 @@ public class MainHook implements IXposedHookLoadPackage {
             g2.add(miRow(act, "去广告拦截", "开屏广告·渠道闸门+网络层+兜底", swAd));
             android.widget.Switch swRev = miSwitch(act, prefAntiRevoke);
             g2.add(miRow(act, "消息防撤回", "私信撤回可见, 原文保留", swRev));
+            android.widget.Switch swQuality = miSwitch(act, prefQualityHud);
+            g2.add(miRow(act, "真实音质显示", "播放时在 HUD 显示服务器实际下发的音质(需开 HUD)", swQuality));
+            android.widget.Switch swPopup = miSwitch(act, prefPopupClean);
+            g2.add(miRow(act, "运营弹窗拦截", "清空投递系统的弹窗/浮层资源(batch-deliver)", swPopup));
             addGroup(act, panel, d, "g2", "播放与防护", false, g2, 1);
 
             // ---------- 组 3: 调试与采集(默认折叠) ----------
@@ -3283,6 +3295,24 @@ public class MainHook implements IXposedHookLoadPackage {
                 public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
                     prefAntiRevoke = checked; savePref(act, "antirevoke", checked);
                     flog("SET", "消息防撤回 -> " + checked);
+                }
+            });
+            swQuality.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                    prefQualityHud = checked; savePref(act, "quality_hud", checked);
+                    flog("SET", "真实音质显示 -> " + checked);
+                }
+            });
+            swPopup.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                    prefPopupClean = checked; savePref(act, "popup_clean", checked);
+                    flog("SET", "运营弹窗拦截 -> " + checked);
+                }
+            });
+            swSplash.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                public void onCheckedChanged(android.widget.CompoundButton btn, boolean checked) {
+                    prefSplashCustom = checked; savePref(act, "splash_custom", checked);
+                    flog("SET", "自定义开屏图 -> " + checked + " (下次冷启动生效)");
                 }
             });
             swHud.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
@@ -6310,6 +6340,71 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // v20: 把指定 key 的数组清空(data:[...] → data:[]), 字符串感知的括号匹配
+    // v1.0.22: 把 json 里所有 "key":{...} 对象整体替换为 "key":null(括号配对+字符串感知)
+    //   用于 batch-deliver: 每个坑位的 resourceData 置 null = 服务端自身的"无投递"合法形态
+    private static String nullJsonObjectsForKey(String json, String key) {
+        String pat = "\"" + key + "\":{";
+        String rep = "\"" + key + "\":null";
+        StringBuilder sb = new StringBuilder();
+        int pos = 0, changed = 0;
+        while (true) {
+            int i = json.indexOf(pat, pos);
+            if (i < 0) break;
+            sb.append(json, pos, i).append(rep);
+            int depth = 0;
+            boolean inStr = false, esc = false;
+            int p = i + pat.length() - 1;   // 指向 '{'
+            int end = json.length();
+            for (; p < json.length(); p++) {
+                char c = json.charAt(p);
+                if (inStr) {
+                    if (esc) esc = false;
+                    else if (c == '\\') esc = true;
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (c == '"') { inStr = true; continue; }
+                if (c == '{') depth++;
+                else if (c == '}') {
+                    depth--;
+                    if (depth == 0) { end = p + 1; changed++; break; }
+                }
+            }
+            pos = end;
+        }
+        if (changed == 0) return null;
+        sb.append(json.substring(pos));
+        return sb.toString();
+    }
+
+    // v1.0.22: 把 "key":{...} 清成 "key":{} (用于 global/popup 的 data 对象)
+    private static String emptyJsonObjectField(String json, String key) {
+        String pat = "\"" + key + "\":{";
+        int i = json.indexOf(pat);
+        if (i < 0) return null;
+        int depth = 0;
+        boolean inStr = false, esc = false;
+        int p = i + pat.length() - 1;
+        for (; p < json.length(); p++) {
+            char c = json.charAt(p);
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    return json.substring(0, i + pat.length()) + "}" + json.substring(p + 1);
+                }
+            }
+        }
+        return null;
+    }
+
     private static String emptyJsonArrayForKey(String json, String key) {
         String pat = "\"" + key + "\":";
         int i = json.indexOf(pat);
@@ -6611,6 +6706,81 @@ public class MainHook implements IXposedHookLoadPackage {
         t = t.trim();
         if (t.length() > 40) t = t.substring(0, 40);
         return t.replace('|', '／');
+    }
+
+    // ===== v1.0.22: 开屏图自定义(图片加载, mtime 缓存) =====
+    private static android.graphics.Bitmap splashBm = null;
+    private static long splashBmSrc = 0L;
+
+    private static android.graphics.Bitmap splashBitmap(android.content.Context ctx) {
+        try {
+            java.io.File f = new java.io.File("/sdcard/Android/data/" + TARGET_PKG + "/files/cmhook_splash.png");
+            if (!f.exists()) {
+                java.io.File f2 = new java.io.File("/sdcard/Android/data/" + TARGET_PKG + "/files/cmhook_splash.jpg");
+                f = f2.exists() ? f2 : f;
+            }
+            if (!f.exists()) return null;
+            long mt = f.lastModified();
+            if (splashBm != null && splashBmSrc == mt) return splashBm;
+            android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), o);
+            int sw = android.content.res.Resources.getSystem().getDisplayMetrics().widthPixels;
+            int sh = android.content.res.Resources.getSystem().getDisplayMetrics().heightPixels;
+            int sample = 1;
+            while (Math.max(o.outWidth, o.outHeight) / (sample * 2) >= Math.max(sw, sh)) sample *= 2;
+            android.graphics.BitmapFactory.Options o2 = new android.graphics.BitmapFactory.Options();
+            o2.inSampleSize = sample;
+            android.graphics.Bitmap bm = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), o2);
+            splashBm = bm;
+            splashBmSrc = mt;
+            return bm;
+        } catch (Throwable t) { return null; }
+    }
+
+    // ===== v1.0.22: 真实音质解析(player/url 响应) =====
+    private static String extractJsonStr(String text, String key) {
+        int i = text.indexOf(key);
+        if (i < 0) return null;
+        int s = i + key.length();
+        int e = text.indexOf('"', s);
+        if (e < 0 || e - s > 40) return null;
+        return text.substring(s, e);
+    }
+
+    private static String extractJsonNum(String text, String key) {
+        int i = text.indexOf(key);
+        if (i < 0) return null;
+        int s = i + key.length();
+        int e = s;
+        while (e < text.length() && e - s < 12) {
+            char c = text.charAt(e);
+            if (c < '0' || c > '9') break;
+            e++;
+        }
+        return (e > s) ? text.substring(s, e) : null;
+    }
+
+    private static String parsePlayerQuality(String text) {
+        String level = extractJsonStr(text, "\"level\":\"");
+        if (level == null || level.length() == 0) return null;
+        String cn;
+        if ("standard".equals(level)) cn = "标准";
+        else if ("higher".equals(level)) cn = "较高";
+        else if ("exhigh".equals(level)) cn = "极高";
+        else if ("lossless".equals(level)) cn = "无损";
+        else if ("hires".equals(level)) cn = "Hi-Res";
+        else if ("jymaster".equals(level)) cn = "超清母带";
+        else cn = level;
+        StringBuilder sb = new StringBuilder(cn);
+        String enc = extractJsonStr(text, "\"encodeType\":\"");
+        if (enc != null && enc.length() > 0) sb.append('/').append(enc);
+        String br = extractJsonNum(text, "\"br\":");
+        if (br != null) {
+            try { sb.append(' ').append(Integer.parseInt(br) / 1000).append("kbps"); } catch (Throwable t) { }
+        }
+        if (text.indexOf("\"freeTrialInfo\":{") >= 0) sb.append(" (试听片段)");
+        return sb.toString();
     }
 
     // ===== 反射 org.json =====
@@ -7006,6 +7176,29 @@ public class MainHook implements IXposedHookLoadPackage {
             });
             flog("INIT", "cronet探针已装");
         } catch (Throwable t) { flog("INIT", "cronet探针失败: " + t); }
+
+        try {
+            // v1.0.22: 开屏图自定义 — MainActivity onCreate 前把窗口背景换成自定义图
+            // (系统预览首帧仍是原 logo, 进程起来后的闪屏时长显示自定义图)
+            XposedHelpers.findAndHookMethod("android.app.Activity", lpp.classLoader, "onCreate",
+                "android.os.Bundle", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        try {
+                            if (!prefSplashCustom) return;
+                            android.app.Activity act = (android.app.Activity) param.thisObject;
+                            if (act == null || !"com.netease.cloudmusic.activity.MainActivity".equals(act.getClass().getName())) return;
+                            if (act.getWindow() == null) return;
+                            android.graphics.Bitmap bm = splashBitmap(act);
+                            if (bm == null || bm.isRecycled()) return;
+                            act.getWindow().setBackgroundDrawable(new android.graphics.drawable.BitmapDrawable(
+                                    act.getResources(), bm));
+                            flog("SPLASH", "开屏图已替换 " + bm.getWidth() + "x" + bm.getHeight());
+                        } catch (Throwable t) { flog("SPLASH", "<err " + t + ">"); }
+                    }
+                });
+            flog("INIT", "hooked MainActivity onCreate (开屏图自定义)");
+        } catch (Throwable t) { flog("SPLASH", "hook 失败: " + t); }
 
         try {
             // e) Activity.onCreate 存活校验
@@ -7640,6 +7833,44 @@ public class MainHook implements IXposedHookLoadPackage {
                                     }
                                 }
                             } catch (Throwable t5) { flog("ADBLOCK", "<bidget err " + t5 + ">"); }
+                        }
+                        // v1.0.22: 真实音质验证器 — 请求里的 level 是"我想要的", 响应 data[0] 的 level/br 才是服务器实际下发的
+                        if (prefQualityHud && url2 != null && url2.indexOf("song/enhance/player/url") >= 0
+                                && text != null && text.length() > 2 && text.charAt(text.length() - 1) == '}') {
+                            try {
+                                String q = parsePlayerQuality(text);
+                                if (q != null) {
+                                    flog("QUALITY", "实际音质: " + q);
+                                    hud("QUALITY", "实际音质: " + q);
+                                }
+                            } catch (Throwable t6) { flog("QUALITY", "<err " + t6 + ">"); }
+                        }
+                        // v1.0.22: 运营弹窗/浮层拦截 — batch-deliver 是运营资源投递系统(弹窗/浮层/试听引导),
+                        // 每个坑位 resourceData 置 null = 服务端自身的"无投递"合法形态, 坑位结构保留
+                        if (prefPopupClean && url2 != null && url2.indexOf("delivery/batch-deliver") >= 0
+                                && text != null && text.length() > 2) {
+                            try {
+                                String out7 = nullJsonObjectsForKey(text, "resourceData");
+                                if (out7 != null && out7.length() != text.length()) {
+                                    flog("POPUP_CLEAN", "运营投递资源已清空: " + text.length() + " → " + out7.length() + " 字节");
+                                    Object nr7 = rebuildResponse(resp, out7, cl);
+                                    if (nr7 != null) setParamResult(param, nr7);
+                                } else if (out7 != null) {
+                                    flog("POPUP_CLEAN", "投递响应本就无资源(len=" + text.length() + ")");
+                                }
+                            } catch (Throwable t7) { flog("POPUP_CLEAN", "<err " + t7 + ">"); }
+                        }
+                        // global/popup/* = 全局弹窗类接口(如耳机设备弹窗): data 对象清空
+                        if (prefPopupClean && url2 != null && url2.indexOf("global/popup/") >= 0
+                                && text != null && text.indexOf("\"data\":{") >= 0) {
+                            try {
+                                String out8 = emptyJsonObjectField(text, "data");
+                                if (out8 != null && out8.length() != text.length()) {
+                                    flog("POPUP_CLEAN", "全局弹窗数据已清空: " + text.length() + " → " + out8.length() + " 字节");
+                                    Object nr8 = rebuildResponse(resp, out8, cl);
+                                    if (nr8 != null) setParamResult(param, nr8);
+                                }
+                            } catch (Throwable t8) { flog("POPUP_CLEAN", "<popup err " + t8 + ">"); }
                         }
                     } catch (Throwable t) { flog("HTTP_RESP", "<err " + t + ">"); }
                 }
