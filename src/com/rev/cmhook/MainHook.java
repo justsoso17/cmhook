@@ -3083,7 +3083,7 @@ public class MainHook implements IXposedHookLoadPackage {
             android.widget.Switch swBottomMid = miSwitch(act, prefBottomMidHide);
             g1.add(miRow(act, "隐藏底栏中间入口", "隐藏底栏中间的「笔记/关注」tab, 重启恢复", swBottomMid));
             android.widget.Switch swStickyBanner = miSwitch(act, prefStickyBannerHide);
-            g1.add(miRow(act, "隐藏免费听横幅", "隐藏播放条上方「免费听时长已耗尽」推广条, 即时生效", swStickyBanner));
+            g1.add(miRow(act, "隐藏免费听横幅", "隐藏播放条上方推广条, 不限文案, 即时生效", swStickyBanner));
             addGroup(act, panel, d, "g1", "界面与清理", false, g1, 0);
 
             // ---------- 抽屉VIP卡图片: 预览 + 选图 (v8.7) ----------
