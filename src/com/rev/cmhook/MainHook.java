@@ -503,6 +503,13 @@ public class MainHook implements IXposedHookLoadPackage {
             int sh = android.content.res.Resources.getSystem().getDisplayMetrics().heightPixels;
             int sw = android.content.res.Resources.getSystem().getDisplayMetrics().widthPixels;
             boolean onMain = (TARGET_PKG + ".activity.MainActivity").equals(sTopActivity);
+            // v1.0.22-fix: 播放条矩形每轮算一次(跨窗口共享) — 横幅提示条在独立悬浮窗里, 窗内无播放条
+            if (prefStickyBannerHide) {
+                for (android.view.View r0 : roots) {
+                    findPbRect(r0);
+                    if (sPbRect != null) break;
+                }
+            }
             for (android.view.View root : roots) {
                 // 只扫主窗口: 对话框/浮窗/HUD 窗口一律不碰(防误伤模块面板等)
                 if (root.getWidth() < sw * 0.95) continue;
@@ -547,6 +554,9 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
                 if (prefStickyBannerHide) {
                     hid += hideStickyBanner(root, sh, sw);
+                }
+                if (prefStickyBannerHide) {
+                    try { hideBarOverlays(root, sh, sw); } catch (Throwable t) { }
                 }
             }
             if (hid > 0) flog("SET", "界面清理: 本次隐藏 " + hid + " 个视图");
@@ -627,6 +637,107 @@ public class MainHook implements IXposedHookLoadPackage {
             for (int i = 0; i < g.getChildCount(); i++) n += hideBottomMid(g.getChildAt(i), sh, sw);
         }
         return n;
+    }
+
+    // v1.0.22-fix: 播放条邻区自绘横幅兜底 —— 「无可用网络」等提示条为 Canvas 直绘匿名 ViewGroup
+    //   (1080x165, 无 id 无 TextView), 文案/结构双路都看不见; 但位置特征极稳:
+    //   紧贴播放条(minPlayerBarContainer, 语义 id)上方或与其重叠的全宽匿名条状层。
+    //   几何规则(全部相对播放条尺寸, 跨机不依赖像素): 全宽 ≥0.9 / 高 0.4~1.6×播放条 /
+    //   底缘压播放条顶(±0.25×高) / 自身无 id / 子树无可见文本(歌单行有歌名, 滚动经过不误伤) /
+    //   纵向与播放条邻区(上方 1.6×高 至 底缘)重叠 / 自身无 id / 非 minplayer 家族。
+    private static android.view.View findViewByIdName(android.view.View v, String kw, int depth) {
+        if (v == null || depth > 30) return null;
+        if (rvIdNameHas(v, kw)) return v;
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                android.view.View r = findViewByIdName(g.getChildAt(i), kw, depth + 1);
+                if (r != null) return r;
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasMinplayerAncestor(android.view.View v, int depth) {
+        android.view.ViewParent p = v.getParent();
+        while (p instanceof android.view.View && depth-- > 0) {
+            android.view.View pv = (android.view.View) p;
+            if (rvIdNameHas(pv, "minplayer")) return true;
+            p = pv.getParent();
+        }
+        return false;
+    }
+
+    // 子树里是否存在非空文本的 TextView(限深 6) —— 自绘横幅无文本, 列表行有歌名
+    private static boolean subtreeHasVisibleText(android.view.View v, int depth) {
+        if (v == null || depth > 6) return false;
+        if (v instanceof android.widget.TextView) {
+            CharSequence cs = ((android.widget.TextView) v).getText();
+            if (cs != null && cs.length() > 0) return true;
+        }
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                if (subtreeHasVisibleText(g.getChildAt(i), depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static volatile long sLastRejLog = 0L;
+    private static int[] sPbRect = null;   // 播放条矩形 {x,y,w,h} — 每轮扫描算一次, 供全部窗口共用
+                                           // (横幅提示条住在独立悬浮窗里, 该窗口内没有播放条, 必须跨窗共享)
+    private static int hideBarOverlays(android.view.View root, int sh, int sw) {
+        if (sPbRect == null) return 0;
+        walkBarOverlays(root, sPbRect[1], sPbRect[3], sPbRect[2], sw);
+        return 0;
+    }
+
+    private static void findPbRect(android.view.View root) {
+        android.view.View pb = findViewByIdName(root, "minplayerbarcontainer", 0);
+        if (pb != null && pb.getWidth() > 0 && pb.getHeight() > 0) {
+            int[] l = new int[2];
+            pb.getLocationOnScreen(l);
+            sPbRect = new int[]{l[0], l[1], pb.getWidth(), pb.getHeight()};
+        }
+    }
+
+    private static void walkBarOverlays(android.view.View v, int pbTop, int pbH, int pbW, int sw) {
+        if (v == null || !(v instanceof android.view.ViewGroup)) return;
+        android.view.ViewGroup g = (android.view.ViewGroup) v;
+        for (int i = g.getChildCount() - 1; i >= 0; i--) {
+            android.view.View c = g.getChildAt(i);
+            int w = c.getWidth(), h = c.getHeight();
+            int[] loc = new int[2];
+            c.getLocationOnScreen(loc);
+            boolean inZone = w >= pbW * 0.9 && h >= pbH * 0.4 && h <= pbH * 1.6
+                    && loc[1] + h >= pbTop - (int) (pbH * 0.25) && loc[1] <= pbTop + pbH;
+            String rej = "";
+            if (inZone) {
+                if (c.getId() != android.view.View.NO_ID) rej = "有id:" + rvIdNameSafe(c);
+                else if (rvIdNameHas(c, "minplayer")) rej = "minplayer本人";
+                else if (hasMinplayerAncestor(c, 12)) rej = "minplayer祖先";
+                else if (subtreeHasVisibleText(c, 0)) rej = "子树有文本";
+                if (rej.length() > 0) {
+                    long nowMs = System.currentTimeMillis();
+                    if (nowMs - sLastRejLog > 1500) {
+                        sLastRejLog = nowMs;
+                        flog("SET", "横幅几何候选拒绝[" + rej + "]: <" + c.getClass().getSimpleName()
+                                + " id=" + rvIdNameSafe(c) + " " + w + "x" + h + " @" + loc[0] + "," + loc[1] + ">");
+                    }
+                }
+            }
+            boolean stripLike = inZone && rej.length() == 0;
+            if (stripLike && c.getVisibility() == android.view.View.VISIBLE) {
+                c.setVisibility(android.view.View.GONE);
+                if (!sUiCleanHidden.contains(c)) sUiCleanHidden.add(c);
+                flog("SET", "横幅隐藏[几何]: <" + c.getClass().getSimpleName() + " " + w + "x" + h
+                        + " @" + loc[0] + "," + loc[1] + ">");
+            }
+            if (c instanceof android.view.ViewGroup) {
+                walkBarOverlays(c, pbTop, pbH, pbW, sw);
+            }
+        }
     }
 
     // 子树里是否有 contentDescription 精确命中 texts(限深 8)
