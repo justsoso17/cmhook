@@ -618,7 +618,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // 子树里是否有 contentDescription 精确命中 texts(限深 8)
     // (9.6.x 底栏/部分 RN 节点的可见标签只登记在无障碍描述里, 文本为空)
-    // 粘性横幅: 锚点=文本命中 STICKY_BANNER_TEXTS 的叶子 TextView, 爬最外层条状祖先(高≤64dp 且宽≥60%屏)
+    // 粘性横幅: 双路识别 —— 结构(坑位 id titleTV/actionTV, 不看文案, 换文案也拦)优先, 关键词兜底; 爬最外层条状祖先(高≤64dp 且宽≥60%屏)
     // GONE + 进 sUiCleanHidden 保护集(宿主再设 VISIBLE 会被压回)
     private static final String[] STICKY_BANNER_TEXTS = {"免费听时长", "畅听免费"};
 
@@ -631,9 +631,12 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         if (v instanceof android.widget.TextView) {
             CharSequence cs = ((android.widget.TextView) v).getText();
-            if (cs == null || !textContainsAny(cs, STICKY_BANNER_TEXTS)) return 0;
-            // v1.0.21-fix: 爬容器上限改 dp 判据(横幅 ~52dp; 播放条 minPlayerBar ~79dp 也 ≤300px,
-            //   vc195 的 300px 上限把播放条整个 GONE 掉了 —— 像素阈值跨机不可靠, kb 有前科)
+            // v1.0.22-fix: 双路识别 —— 结构优先(坑位语义 id titleTV/actionTV, 不看文案, 运营换文案也拦),
+            // 关键词降为兜底(id 改名时仍按已知文案命中)
+            boolean byId = rvIdNameHas(v, "titletv") || rvIdNameHas(v, "actiontv");
+            boolean byText = cs != null && textContainsAny(cs, STICKY_BANNER_TEXTS);
+            if (!byId && !byText) return 0;
+            // 爬容器上限 dp 判据(横幅 ~52dp; 播放条 ~79dp —— 像素阈值跨机不可靠, kb 有前科)
             int maxH = (int) (64 * android.content.res.Resources.getSystem().getDisplayMetrics().density);
             android.view.View best = v;
             android.view.View cur = v;
@@ -646,14 +649,16 @@ public class MainHook implements IXposedHookLoadPackage {
                 cur = pv;
                 p = cur.getParent();
             }
+            // 位置校验: 条状层底缘须落在屏幕底部 30% 区域(粘性横幅槽的固定位置), 防误伤别处的 titleTV
+            int[] bloc = new int[2];
+            best.getLocationOnScreen(bloc);
+            if (bloc[1] + best.getHeight() < sh * 0.7) return 0;
             if (best.getVisibility() != android.view.View.GONE) {
                 best.setVisibility(android.view.View.GONE);
                 if (!sUiCleanHidden.contains(best)) sUiCleanHidden.add(best);
                 n++;
-                // v1.0.21-fix2: 每次隐藏都记明细(类/id/尺寸/锚文本) —— 不再依赖一次性链日志定位误伤
-                int[] bloc = new int[2];
-                best.getLocationOnScreen(bloc);
-                flog("SET", "横幅隐藏: <" + best.getClass().getSimpleName()
+                // 每次隐藏都记明细(类/id/尺寸/位置/命中路径/锚文本)
+                flog("SET", "横幅隐藏[" + (byId ? "结构" : "文案") + "]: <" + best.getClass().getSimpleName()
                         + " id=" + rvIdNameSafe(best) + " " + best.getWidth() + "x" + best.getHeight()
                         + " @" + bloc[0] + "," + bloc[1] + "> anchor=" + cs);
                 if (!sUiCleanChainLogged) {
@@ -7908,10 +7913,13 @@ public class MainHook implements IXposedHookLoadPackage {
                         Object a0 = param.args[0];
                         String t = a0 instanceof CharSequence ? a0.toString() : null;
                         if (t == null || t.length() == 0 || t.length() > 40) return;
-                        // UI 清理触发: 抽屉菜单项 / 底栏中间 tab / 免费听横幅 文本绑定时排扫描
+                        // UI 清理触发: 抽屉菜单项 / 底栏中间 tab / 免费听横幅(文案或坑位 id)绑定时排扫描
+                        boolean bannerIdHit = prefStickyBannerHide && param.thisObject instanceof android.view.View
+                                && (rvIdNameHas((android.view.View) param.thisObject, "titletv")
+                                    || rvIdNameHas((android.view.View) param.thisObject, "actiontv"));
                         if ((prefDrawerClean && textInList(t, DRAWER_ITEM_TEXTS))
                                 || (prefBottomMidHide && textInList(t, BOTTOM_MID_TEXTS))
-                                || (prefStickyBannerHide && textContainsAny(t, STICKY_BANNER_TEXTS))) {
+                                || (prefStickyBannerHide && (textContainsAny(t, STICKY_BANNER_TEXTS) || bannerIdHit))) {
                             scheduleUiCleanScan();
                         }
                         boolean hit = t.contains("期待您的回归") || t.contains("特权已失效") || t.contains("续费立享")
