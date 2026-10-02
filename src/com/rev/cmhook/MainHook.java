@@ -470,8 +470,21 @@ public class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
+    private static volatile long sLastBannerScan = 0L;
+
+    // 横幅命中时的快速排程: 全局 1.5s 节流会吃掉"横幅刚绑定就排扫描"的请求(复现窗口来源),
+    // 单独 500ms 节流 + 150/900ms 两连扫
+    private static void scheduleBannerScan() {
+        long now = System.currentTimeMillis();
+        if (now - sLastBannerScan < 500) return;
+        sLastBannerScan = now;
+        android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        h.postDelayed(new Runnable() { public void run() { try { scanUiClean(); } catch (Throwable t) { } } }, 150);
+        h.postDelayed(new Runnable() { public void run() { try { scanUiClean(); } catch (Throwable t) { } } }, 900);
+    }
+
     private static void scheduleUiCleanScan() {
-        if (!prefDrawerClean && !prefBottomMidHide) return;
+        if (!prefDrawerClean && !prefBottomMidHide && !prefStickyBannerHide) return;   // v1.0.22-fix: 补横幅开关(vc203 遗漏)
         long now = System.currentTimeMillis();
         if (now - sLastUiScanSchedule < 1500) return;
         sLastUiScanSchedule = now;
@@ -7919,8 +7932,11 @@ public class MainHook implements IXposedHookLoadPackage {
                                     || rvIdNameHas((android.view.View) param.thisObject, "actiontv"));
                         if ((prefDrawerClean && textInList(t, DRAWER_ITEM_TEXTS))
                                 || (prefBottomMidHide && textInList(t, BOTTOM_MID_TEXTS))
-                                || (prefStickyBannerHide && (textContainsAny(t, STICKY_BANNER_TEXTS) || bannerIdHit))) {
+                                || (prefStickyBannerHide && textContainsAny(t, STICKY_BANNER_TEXTS))) {
                             scheduleUiCleanScan();
+                        }
+                        if (prefStickyBannerHide && (bannerIdHit || textContainsAny(t, STICKY_BANNER_TEXTS))) {
+                            scheduleBannerScan();   // v1.0.22-fix: 横幅绑定即时快扫, 绕过全局节流
                         }
                         boolean hit = t.contains("期待您的回归") || t.contains("特权已失效") || t.contains("续费立享")
                                 || t.contains("会员特权") || t.contains("每日打卡") || t.contains("学生特惠")
